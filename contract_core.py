@@ -591,7 +591,7 @@ def analyze_contract(contract_path: str, use_anonymization: bool = True, restore
         else:
             contract_text = contract_text_raw
 
-                retrieval_query = """
+retrieval_query = """
 대학과 기업 간 계약 검토.
 
 먼저 확인할 사항:
