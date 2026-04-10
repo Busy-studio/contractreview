@@ -89,6 +89,10 @@ def resolve_law_zip(zip_path: str | None = None, zip_link: str | None = None) ->
     if zip_path and str(zip_path).strip():
         return validate_zip_path(zip_path)
 
+    local_zip_path = Path("lawcollect.zip")
+    if local_zip_path.exists() and zipfile.is_zipfile(local_zip_path):
+        return str(local_zip_path)
+
     link = (zip_link or DEFAULT_LAW_ZIP_LINK).strip()
     hashed = hashlib.md5(link.encode("utf-8")).hexdigest()[:16]
     cached_zip_path = CACHE_DIR / f"law_zip_{hashed}.zip"

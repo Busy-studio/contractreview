@@ -13,7 +13,7 @@ from contract_core import (
 )
 
 st.set_page_config(
-    page_title="대학-기업 계약/협약서 검토 AI",
+    page_title="PNU 계약/협약서 검토",
     page_icon="📄",
     layout="wide",
 )
@@ -26,8 +26,8 @@ def save_uploaded_file(uploaded_file) -> str:
         return tmp.name
 
 
-st.title("대학-기업 계약/협약서 검토 AI")
-st.caption("기본값은 기존 법령/규정 Google Drive 링크를 그대로 사용합니다. 필요할 때만 ZIP 업로드 또는 링크 변경을 하면 됩니다.")
+st.title("PNU 계약/협약서 검토")
+st.caption("기본값은 기존 법령/규정을 그대로 사용합니다. 필요할 때만 ZIP 업로드 또는 링크 변경을 하면 됩니다.")
 
 with st.sidebar:
     st.subheader("실행 환경")
