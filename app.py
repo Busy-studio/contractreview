@@ -6,7 +6,6 @@ import streamlit as st
 
 from contract_core import (
     ConfigError,
-    DEFAULT_LAW_ZIP_LINK,
     ValidationError,
     analyze_contract,
     preview_anonymized,
@@ -27,32 +26,33 @@ def save_uploaded_file(uploaded_file) -> str:
 
 
 st.title("PNU 계약/협약서 검토")
-st.caption("기본값은 기존 법령/규정을 그대로 사용합니다. 필요할 때만 ZIP 업로드 또는 링크 변경을 하면 됩니다.")
+st.caption("기본값은 저장소의 lawcollect.zip을 자동으로 사용합니다. 필요할 때만 ZIP 업로드 또는 외부 링크를 사용하면 됩니다.")
 
 with st.sidebar:
     st.subheader("실행 환경")
     gemini_key_exists = bool(os.getenv("GEMINI_API_KEY", "").strip() or os.getenv("GOOGLE_API_KEY", "").strip())
     st.write(f"- Gemini API Key 설정 여부: {'설정됨' if gemini_key_exists else '미설정'}")
     st.write("- 지원 계약서 형식: PDF, DOCX, TXT, MD")
-    st.write("- 법령 ZIP 기본값: 기존 Google Drive 링크 사용")
+    st.write("- 법령 ZIP 기본값: 저장소의 lawcollect.zip 우선 사용")
+    st.write("- 외부 링크는 lawcollect.zip이 없을 때만 사용")
     st.write("- 법령 인덱스: 동일 ZIP 재사용 시 캐시 사용")
 
 st.subheader("법령/규정 소스")
 source_mode = st.radio(
-    "사용 방식 선택",
-    ["기본 Drive 링크 사용", "직접 ZIP 업로드", "Drive 링크 직접 입력"],
+    "법령/규정 사용 방식",
+    ["기본값 사용(lawcollect.zip)", "직접 ZIP 업로드", "외부 링크 사용"],
     horizontal=True,
 )
 
 law_zip = None
-law_zip_link = DEFAULT_LAW_ZIP_LINK
+law_zip_link = None
 
 if source_mode == "직접 ZIP 업로드":
     law_zip = st.file_uploader("법령/규정 ZIP 업로드", type=["zip"])
-elif source_mode == "Drive 링크 직접 입력":
-    law_zip_link = st.text_input("법령/규정 Google Drive 링크", value=DEFAULT_LAW_ZIP_LINK)
+elif source_mode == "외부 링크 사용":
+    law_zip_link = st.text_input("법령/규정 ZIP 링크 (Google Drive 등)")
 else:
-    st.text_input("기본 Google Drive 링크", value=DEFAULT_LAW_ZIP_LINK, disabled=True)
+    st.info("저장소에 포함된 lawcollect.zip을 자동으로 사용합니다.")
 
 st.subheader("계약서 설정")
 col1, col2 = st.columns([1, 1])
@@ -113,7 +113,8 @@ with st.expander("Streamlit Cloud 설정 방법"):
         4. Settings > Secrets에 아래 중 하나를 추가합니다.
            - `GEMINI_API_KEY=...`
            - `GOOGLE_API_KEY=...`
-        5. 기본값으로는 기존 법령 Google Drive 링크를 그대로 사용합니다.
-        6. 같은 법령 ZIP을 반복 사용하면 `.cache`의 인덱스를 재사용합니다.
+        5. 기본값으로는 저장소의 lawcollect.zip을 자동 사용합니다.
+        6. lawcollect.zip이 없을 경우에만 외부 링크를 사용합니다.
+        7. 같은 법령 ZIP을 반복 사용하면 `.cache`의 인덱스를 재사용합니다.
         """
     )
