@@ -3,9 +3,7 @@ import os
 import pickle
 import re
 import shutil
-import tempfile
 import time
-import traceback
 import zipfile
 from collections import defaultdict
 from pathlib import Path
@@ -18,7 +16,10 @@ from docx import Document
 from google import genai
 from google.genai import errors as genai_errors
 
-GEN_MODELS = ["gemini-2.5-flash"]
+GEN_MODELS = [
+    "gemini-2.5-flash",
+    "gemini-3.1-flash-lite-preview",
+]
 EMBED_MODEL = "gemini-embedding-001"
 DEFAULT_LAW_ZIP_LINK = "https://drive.google.com/file/d/1Wu5sEWPwdH7AX2n_08ViNCEZtZnhsMwH/view?usp=sharing"
 CACHE_DIR = Path(".cache")
@@ -300,9 +301,9 @@ def anonymize_contract_text(text: str):
             text = replace_token_everywhere(text, token, label)
 
     alias_patterns = [
-        r'(?P<entity>[^\n()]{2,180}?)\s*\(\s*이하\s*[\'"“”‘’](?P<alias>[^\'"“”‘’]{1,50})[\'"“”‘’]\s*이라?\s*한다\s*\)',
-        r'(?P<entity>[^\n()]{2,180}?)\s*\(\s*이하\s*[\'"“”‘’](?P<alias>[^\'"“”‘’]{1,50})[\'"“”‘’]\s*\)',
-        r'(?P<entity>[^\n()]{2,180}?)\s*이하\s*[\'"“”‘’](?P<alias>[^\'"“”‘’]{1,50})[\'"“”‘’]\s*이라?\s*한다',
+        r'(?P<entity>[^\n()]{2,180}?)\s*\(\s*이하\s*[\'\"“”‘’](?P<alias>[^\'\"“”‘’]{1,50})[\'\"“”‘’]\s*이라?\s*한다\s*\)',
+        r'(?P<entity>[^\n()]{2,180}?)\s*\(\s*이하\s*[\'\"“”‘’](?P<alias>[^\'\"“”‘’]{1,50})[\'\"“”‘’]\s*\)',
+        r'(?P<entity>[^\n()]{2,180}?)\s*이하\s*[\'\"“”‘’](?P<alias>[^\'\"“”‘’]{1,50})[\'\"“”‘’]\s*이라?\s*한다',
     ]
 
     alias_pairs = []
@@ -522,21 +523,36 @@ def search(index, query, k=8):
 def generate_with_retry(prompt, max_retries=6):
     client = get_client()
     last_error = None
+
     for model_name in GEN_MODELS:
         for attempt in range(max_retries):
             try:
-                return client.models.generate_content(model=model_name, contents=prompt)
+                return client.models.generate_content(
+                    model=model_name,
+                    contents=prompt
+                )
             except genai_errors.ServerError as e:
                 last_error = e
                 msg = str(e)
+
                 if "503" in msg or "UNAVAILABLE" in msg or "high demand" in msg.lower():
-                    time.sleep(min(2 ** attempt, 30))
+                    wait_sec = min(2 ** attempt, 30)
+                    time.sleep(wait_sec)
                     continue
+
                 raise
             except Exception as e:
                 last_error = e
                 break
-    raise last_error
+
+    if last_error:
+        if "503" in str(last_error) or "UNAVAILABLE" in str(last_error):
+            raise RuntimeError(
+                "현재 Gemini 모델 응답이 일시적으로 몰려 있습니다. 잠시 후 다시 실행해 주세요."
+            )
+        raise last_error
+
+    raise RuntimeError("모델 응답 생성에 실패했습니다.")
 
 
 def preview_anonymized(contract_path):
@@ -735,4 +751,4 @@ def analyze_contract(contract_path: str, use_anonymization: bool = True, restore
         return result_text
 
     except Exception as e:
-        return f"실행 중 오류가 발생했습니다.\n\n{type(e).__name__}: {e}\n\n{traceback.format_exc()}"
+        return f"실행 중 오류가 발생했습니다.\n\n{type(e).__name__}: {e}"
