@@ -1,25 +1,28 @@
+import hashlib
 import os
+import pickle
 import re
-import zipfile
-import traceback
 import shutil
-import time
 import tempfile
-from pathlib import Path
+import time
+import traceback
+import zipfile
 from collections import defaultdict
-from typing import Dict, List, Tuple
+from pathlib import Path
+from typing import List
 
 import fitz
+import gdown
 import numpy as np
 from docx import Document
 from google import genai
 from google.genai import errors as genai_errors
 
-
-GEN_MODELS = [
-    "gemini-2.5-flash",
-]
+GEN_MODELS = ["gemini-2.5-flash"]
 EMBED_MODEL = "gemini-embedding-001"
+DEFAULT_LAW_ZIP_LINK = "https://drive.google.com/file/d/1Wu5sEWPwdH7AX2n_08ViNCEZtZnhsMwH/view?usp=sharing"
+CACHE_DIR = Path(".cache")
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 
 class ConfigError(RuntimeError):
@@ -29,10 +32,6 @@ class ConfigError(RuntimeError):
 class ValidationError(ValueError):
     pass
 
-
-# =========================================================
-# 0. 클라이언트 / 설정
-# =========================================================
 
 def get_api_key() -> str:
     api_key = (
@@ -51,9 +50,26 @@ def get_client() -> genai.Client:
     return genai.Client(api_key=get_api_key())
 
 
-# =========================================================
-# 1. 법령 zip 경로 검증
-# =========================================================
+def download_drive_file(url: str, output_path: str) -> str:
+    if not url or "/d/" not in url:
+        raise ValidationError("올바른 Google Drive 파일 링크 형식이 아닙니다.")
+
+    file_id = url.split("/d/")[1].split("/")[0]
+    output_file = Path(output_path)
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+
+    if output_file.exists():
+        output_file.unlink()
+
+    result = gdown.download(id=file_id, output=str(output_file), quiet=True)
+    if not result or not output_file.exists():
+        raise ValidationError("법령 zip 다운로드에 실패했습니다. 공유 설정을 확인하세요.")
+
+    if not zipfile.is_zipfile(output_file):
+        raise ValidationError("다운로드한 파일이 유효한 zip 형식이 아닙니다.")
+
+    return str(output_file)
+
 
 def validate_zip_path(zip_path: str) -> str:
     if not zip_path or not str(zip_path).strip():
@@ -69,9 +85,19 @@ def validate_zip_path(zip_path: str) -> str:
     return zip_path
 
 
-# =========================================================
-# 2. 파일 텍스트 추출
-# =========================================================
+def resolve_law_zip(zip_path: str | None = None, zip_link: str | None = None) -> str:
+    if zip_path and str(zip_path).strip():
+        return validate_zip_path(zip_path)
+
+    link = (zip_link or DEFAULT_LAW_ZIP_LINK).strip()
+    hashed = hashlib.md5(link.encode("utf-8")).hexdigest()[:16]
+    cached_zip_path = CACHE_DIR / f"law_zip_{hashed}.zip"
+
+    if cached_zip_path.exists() and zipfile.is_zipfile(cached_zip_path):
+        return str(cached_zip_path)
+
+    return download_drive_file(link, str(cached_zip_path))
+
 
 def extract_pdf(path: str) -> str:
     doc = fitz.open(path)
@@ -108,10 +134,6 @@ def extract_text(path: str) -> str:
     raise ValidationError(f"지원하지 않는 파일 형식입니다: {ext}")
 
 
-# =========================================================
-# 3. 텍스트 정리 / 청크
-# =========================================================
-
 def clean_text(text: str) -> str:
     text = text.replace("\x00", " ")
     text = re.sub(r"[ \t]+", " ", text)
@@ -140,13 +162,8 @@ def chunk_text(text: str, size: int = 1200, overlap: int = 200) -> List[str]:
     return chunks
 
 
-# =========================================================
-# 4. 범용 자동 익명화
-# =========================================================
-
 def strip_korean_particles(s: str) -> str:
     s = s.strip()
-
     particles = [
         "으로부터", "에게서", "까지는", "까지도", "에게는", "에서는", "으로는",
         "으로서", "으로써", "이라도", "라고", "라고는", "라도", "까지", "부터",
@@ -166,7 +183,6 @@ def strip_korean_particles(s: str) -> str:
     return s
 
 
-
 def normalize_token(s: str) -> str:
     s = str(s).strip()
     s = s.strip("'\"“”‘’")
@@ -176,10 +192,8 @@ def normalize_token(s: str) -> str:
     return s.strip()
 
 
-
 def is_generic_noun(token: str) -> bool:
     token = normalize_token(token)
-
     generic_block = {
         "상대방", "당사자", "양당사자", "제3자", "직원", "자료", "정보", "결과물",
         "연구결과", "연구개발", "지식재산권", "손해배상", "비밀보장", "표시권", "공표권",
@@ -189,10 +203,8 @@ def is_generic_noun(token: str) -> bool:
     return token in generic_block
 
 
-
 def is_valid_alias_token(token: str) -> bool:
     token = normalize_token(token)
-
     if not token:
         return False
     if len(token) < 2 or len(token) > 40:
@@ -206,9 +218,7 @@ def is_valid_alias_token(token: str) -> bool:
     )
     if token.endswith(bad_suffixes):
         return False
-
     return True
-
 
 
 def anonymize_contract_text(text: str):
@@ -224,10 +234,8 @@ def anonymize_contract_text(text: str):
         token = normalize_token(token)
         if not token:
             return None
-
         if token in mapping:
             return mapping[token]
-
         label = forced_label if forced_label else next_label(label_type)
         mapping[token] = label
         reverse_mapping[label] = token
@@ -237,45 +245,29 @@ def anonymize_contract_text(text: str):
         token = normalize_token(token)
         if not token:
             return text
-
-        variants = [
-            token,
-            f"'{token}'",
-            f'"{token}"',
-            f"‘{token}’",
-            f"“{token}”",
-        ]
-
+        variants = [token, f"'{token}'", f'"{token}"', f"‘{token}’", f"“{token}”"]
         for v in sorted(set(variants), key=len, reverse=True):
             text = text.replace(v, label)
-
         escaped = re.escape(token)
         text = re.sub(rf'(?<![\w가-힣]){escaped}(?![\w가-힣])', label, text)
-
         return text
 
     def guess_label_type(entity: str = "", alias: str = ""):
         entity_n = normalize_token(entity)
         alias_n = normalize_token(alias)
-
         party_aliases = {
             "갑", "을", "병", "정", "무", "기",
             "연구기관", "발주자", "수행기관", "위탁기관", "수탁기관",
             "공급자", "수요자", "계약상대방"
         }
-
         if alias_n in party_aliases:
             return "당사자"
-
-        if any(k in entity_n for k in ["주식회사", "㈜", "회사", "Inc", "Ltd", "Corp"]):
+        if any(k in entity_n for k in ["주식회사", "㈜", "유한회사", "회사", "Inc", "Ltd", "Corp"]):
             return "기업명"
-
         if any(k in entity_n for k in ["대학교", "산학협력단", "연구원", "재단", "센터", "학교", "대학"]):
             return "기관명"
-
         if alias_n in {"비밀정보", "제한적 오픈소스 코드"}:
             return "정의용어"
-
         return "정의용어"
 
     base_patterns = [
@@ -314,21 +306,16 @@ def anonymize_contract_text(text: str):
         for m in re.finditer(pat, text):
             entity = normalize_token(m.group("entity"))
             alias = normalize_token(m.group("alias"))
-
             if not alias:
                 continue
-
             entity = re.sub(r'^(본 계약과 관련하여|계약 수행 중|계약 수행을 위해|본 연구개발의 결과로 발생하는|계약 수행 과정에서)\s*', '', entity).strip()
             entity = re.sub(r'\s*(은|는|이|가|을|를|에|에게|으로부터|와|과)$', '', entity).strip()
-
             if not is_valid_alias_token(alias):
                 continue
-
             alias_pairs.append((entity, alias))
 
     for entity, alias in sorted(alias_pairs, key=lambda x: len(x[0]) + len(x[1]), reverse=True):
         label_type = guess_label_type(entity, alias)
-
         if entity and not is_generic_noun(entity):
             label = add_mapping(entity, label_type)
             add_mapping(alias, label_type, forced_label=label)
@@ -338,9 +325,8 @@ def anonymize_contract_text(text: str):
             label = add_mapping(alias, label_type)
             text = replace_token_everywhere(text, alias, label)
 
-    quoted_tokens = re.findall(r'["\'“‘]([^"\'”’\n]{2,50})["\'”’]', text)
+    quoted_tokens = re.findall(r"[\"'“‘]([^\"'”’\n]{2,50})[\"'”’]", text)
     freq = defaultdict(int)
-
     for q in quoted_tokens:
         qn = normalize_token(q)
         if not qn:
@@ -352,7 +338,6 @@ def anonymize_contract_text(text: str):
         freq[qn] += 1
 
     repeated_quoted = [q for q, cnt in freq.items() if cnt >= 2]
-
     for token in sorted(set(repeated_quoted), key=len, reverse=True):
         if token in mapping:
             label = mapping[token]
@@ -361,7 +346,6 @@ def anonymize_contract_text(text: str):
             if token in {"연구기관", "발주자", "수행기관", "위탁기관", "수탁기관", "갑", "을", "병", "정", "무", "기"}:
                 label_type = "당사자"
             label = add_mapping(token, label_type)
-
         text = replace_token_everywhere(text, token, label)
 
     org_patterns = [
@@ -379,7 +363,9 @@ def anonymize_contract_text(text: str):
     for pat in org_patterns:
         for m in re.findall(pat, text):
             val = normalize_token(m if not isinstance(m, tuple) else max(m, key=len))
-            if not val or is_generic_noun(val):
+            if not val:
+                continue
+            if is_generic_noun(val):
                 continue
             org_candidates.append(val)
 
@@ -414,43 +400,30 @@ def anonymize_contract_text(text: str):
     return text, mapping, reverse_mapping
 
 
-
-def post_fix_alias_leaks(text: str, mapping: Dict[str, str]) -> str:
+def post_fix_alias_leaks(text, mapping):
     for token, label in sorted(mapping.items(), key=lambda x: len(x[0]), reverse=True):
         token_n = token.strip()
-        variants = [
-            token_n,
-            f"'{token_n}'",
-            f'"{token_n}"',
-            f"‘{token_n}’",
-            f"“{token_n}”",
-        ]
+        variants = [token_n, f"'{token_n}'", f'"{token_n}"', f"‘{token_n}’", f"“{token_n}”"]
         for v in variants:
             text = text.replace(v, label)
-
-    text = re.sub(r'["\'“‘](\[[^\]]+\])["\'”’]', r"\1", text)
+    text = re.sub(r"[\"'“‘](\[[^\]]+\])[\"'”’]", r"\1", text)
     return text
 
 
-
-def deanonymize_text(text: str, reverse_mapping: Dict[str, str]) -> str:
+def deanonymize_text(text: str, reverse_mapping: dict):
     if not reverse_mapping:
         return text
-
     for label, original in sorted(reverse_mapping.items(), key=lambda x: len(x[0]), reverse=True):
         text = text.replace(label, original)
-
     return text
 
 
-
-def find_possible_leaks(text: str) -> List[str]:
+def find_possible_leaks(text):
     leak_patterns = [
         r"[‘“'\"]?[가-힣A-Za-z0-9&·\-.]{2,30}[’”'\"]?\s*이라 한다",
         r"[‘“'\"]?[가-힣A-Za-z0-9&·\-.]{2,30}[’”'\"]?\s*의 요청",
         r"[‘“'\"]?[가-힣A-Za-z0-9&·\-.]{2,30}[’”'\"]?\s*의 사전",
     ]
-
     found = set()
     for pat in leak_patterns:
         for m in re.findall(pat, text):
@@ -458,102 +431,93 @@ def find_possible_leaks(text: str) -> List[str]:
                 m = max(m, key=len)
             if "[" not in str(m):
                 found.add(str(m).strip())
-
     return sorted(found)
 
 
-# =========================================================
-# 5. 임베딩 / 검색
-# =========================================================
-
-def embed(texts: List[str], batch_size: int = 50) -> np.ndarray:
+def embed(texts, batch_size=50):
     client = get_client()
     all_vecs = []
-
     for i in range(0, len(texts), batch_size):
         batch = texts[i:i + batch_size]
         res = client.models.embed_content(model=EMBED_MODEL, contents=batch)
         batch_vecs = [e.values for e in res.embeddings]
         all_vecs.extend(batch_vecs)
-
     return np.array(all_vecs, dtype=np.float32)
 
+
+def _zip_fingerprint(zip_path: str) -> str:
+    path = Path(zip_path)
+    stat = path.stat()
+    base = f"{path.resolve()}::{stat.st_size}::{int(stat.st_mtime)}"
+    return hashlib.md5(base.encode("utf-8")).hexdigest()
 
 
 def build_index(zip_path: str):
     zip_path = validate_zip_path(zip_path)
+    fp = _zip_fingerprint(zip_path)
+    cache_file = CACHE_DIR / f"index_{fp}.pkl"
+    unzip_dir = CACHE_DIR / f"unzipped_{fp}"
 
-    work_dir = tempfile.mkdtemp(prefix="law_unzip_")
+    if cache_file.exists():
+        with open(cache_file, "rb") as f:
+            return pickle.load(f)
+
+    if unzip_dir.exists():
+        shutil.rmtree(unzip_dir)
+    unzip_dir.mkdir(parents=True, exist_ok=True)
 
     with zipfile.ZipFile(zip_path, "r") as z:
-        z.extractall(work_dir)
+        z.extractall(unzip_dir)
 
     files = []
-    for root, _, fs in os.walk(work_dir):
+    for root, _, fs in os.walk(unzip_dir):
         for name in fs:
             if name.lower().endswith((".pdf", ".docx", ".txt", ".md")):
                 files.append(os.path.join(root, name))
 
     if not files:
-        shutil.rmtree(work_dir, ignore_errors=True)
         raise ValidationError("zip 내부에서 읽을 수 있는 PDF/DOCX/TXT/MD 파일을 찾지 못했습니다.")
 
     chunks = []
     meta = []
+    for f in files:
+        try:
+            text = extract_text(f)
+            cs = chunk_text(text, size=1200, overlap=200)
+            for c in cs:
+                chunks.append(c)
+                meta.append(f)
+        except Exception as e:
+            print(f"[경고] 파일 처리 실패: {f} / {e}")
 
-    try:
-        for f in files:
-            try:
-                text = extract_text(f)
-                cs = chunk_text(text, size=1200, overlap=200)
-                for c in cs:
-                    chunks.append(c)
-                    meta.append(f)
-            except Exception:
-                continue
+    if not chunks:
+        raise ValidationError("법령/규정 zip에서 텍스트를 추출하지 못했습니다.")
 
-        if not chunks:
-            raise ValidationError("법령/규정 zip에서 텍스트를 추출하지 못했습니다.")
+    emb = embed(chunks, batch_size=50)
+    index = {"chunks": chunks, "meta": meta, "emb": emb}
 
-        emb = embed(chunks, batch_size=50)
-        return {"chunks": chunks, "meta": meta, "emb": emb, "work_dir": work_dir}
-    except Exception:
-        shutil.rmtree(work_dir, ignore_errors=True)
-        raise
+    with open(cache_file, "wb") as f:
+        pickle.dump(index, f)
 
-
-
-def cleanup_index(index: dict) -> None:
-    work_dir = index.get("work_dir")
-    if work_dir:
-        shutil.rmtree(work_dir, ignore_errors=True)
+    return index
 
 
-
-def search(index, query: str, k: int = 8) -> List[str]:
+def search(index, query, k=8):
     qv = embed([query], batch_size=1)[0]
-
     emb = index["emb"]
     qn = np.linalg.norm(qv) + 1e-12
     en = np.linalg.norm(emb, axis=1) + 1e-12
-
     sims = (emb @ qv) / (en * qn)
     idx = np.argsort(-sims)[:k]
-
     results = []
     for i in idx:
         results.append(f"[근거문서: {os.path.basename(index['meta'][i])}]\n{index['chunks'][i]}")
     return results
 
 
-# =========================================================
-# 6. 생성 재시도
-# =========================================================
-
-def generate_with_retry(prompt: str, max_retries: int = 6):
+def generate_with_retry(prompt, max_retries=6):
     client = get_client()
     last_error = None
-
     for model_name in GEN_MODELS:
         for attempt in range(max_retries):
             try:
@@ -562,50 +526,37 @@ def generate_with_retry(prompt: str, max_retries: int = 6):
                 last_error = e
                 msg = str(e)
                 if "503" in msg or "UNAVAILABLE" in msg or "high demand" in msg.lower():
-                    wait_sec = min(2 ** attempt, 30)
-                    time.sleep(wait_sec)
+                    time.sleep(min(2 ** attempt, 30))
                     continue
                 raise
             except Exception as e:
                 last_error = e
                 break
-
     raise last_error
 
 
-# =========================================================
-# 7. 미리보기
-# =========================================================
-
-def preview_anonymized(contract_path: str):
-    if not contract_path:
-        raise ValidationError("계약서 파일을 먼저 업로드하세요.")
-
-    raw_text = extract_text(contract_path)
-    if not raw_text.strip():
-        raise ValidationError("텍스트를 추출하지 못했습니다.")
-
-    anon_text, mapping, _ = anonymize_contract_text(raw_text)
-    anon_text = post_fix_alias_leaks(anon_text, mapping)
-    leak_candidates = find_possible_leaks(anon_text)
-
-    mapping_lines = [f"{label} = {original}" for original, label in sorted(mapping.items(), key=lambda x: (x[1], x[0]))]
-
-    preview_text = anon_text[:12000]
-    mapping_text = "\n".join(mapping_lines[:400]) if mapping_lines else "치환된 항목 없음"
-    leak_text = "\n".join(leak_candidates[:100]) if leak_candidates else "추가 누락 후보 없음"
-
-    return preview_text, mapping_text, leak_text
+def preview_anonymized(contract_path):
+    try:
+        if not contract_path:
+            return "계약서 파일을 먼저 업로드하세요.", "", ""
+        raw_text = extract_text(contract_path)
+        if not raw_text.strip():
+            return "텍스트를 추출하지 못했습니다.", "", ""
+        anon_text, mapping, _ = anonymize_contract_text(raw_text)
+        anon_text = post_fix_alias_leaks(anon_text, mapping)
+        leak_candidates = find_possible_leaks(anon_text)
+        mapping_lines = [f"{label} = {original}" for original, label in sorted(mapping.items(), key=lambda x: (x[1], x[0]))]
+        preview_text = anon_text[:12000]
+        mapping_text = "\n".join(mapping_lines[:400]) if mapping_lines else "치환된 항목 없음"
+        leak_text = "\n".join(leak_candidates[:100]) if leak_candidates else "추가 누락 후보 없음"
+        return preview_text, mapping_text, leak_text
+    except Exception as e:
+        return f"오류: {e}", "", ""
 
 
-# =========================================================
-# 8. 근거 라인 검증
-# =========================================================
-
-def validate_ground_lines(result_text: str) -> List[str]:
+def validate_ground_lines(result_text: str):
     lines = result_text.splitlines()
     invalid = []
-
     for line in lines:
         if line.strip().startswith("문제가 되는 근거:"):
             content = line.split("문제가 되는 근거:", 1)[-1].strip()
@@ -613,31 +564,21 @@ def validate_ground_lines(result_text: str) -> List[str]:
             has_article = bool(re.search(r'제\s*\d+\s*조|제\s*\d+\s*항|제\s*\d+\s*호', content))
             if not (has_doc_name and has_article):
                 invalid.append(line)
-
     return invalid
 
 
-# =========================================================
-# 9. 계약 분석
-# =========================================================
-
-def analyze_contract(
-    zip_path: str,
-    contract_path: str,
-    use_anonymization: bool = True,
-    restore_names: bool = False,
-) -> str:
-    index = None
+def analyze_contract(contract_path: str, use_anonymization: bool = True, restore_names: bool = False,
+                     zip_path: str | None = None, zip_link: str | None = None) -> str:
     try:
-        zip_path = validate_zip_path(zip_path)
         if not contract_path:
-            raise ValidationError("검토할 계약서 파일을 업로드하세요.")
+            return "오류: 검토할 계약서 파일을 업로드하세요."
 
-        index = build_index(zip_path)
+        resolved_zip_path = resolve_law_zip(zip_path=zip_path, zip_link=zip_link)
+        index = build_index(resolved_zip_path)
+
         contract_text_raw = extract_text(contract_path)
-
         if not contract_text_raw.strip():
-            raise ValidationError("계약서에서 텍스트를 추출하지 못했습니다. 스캔 PDF일 수 있습니다.")
+            return "오류: 계약서에서 텍스트를 추출하지 못했습니다. 스캔 PDF일 가능성이 있습니다."
 
         reverse_mapping = {}
         if use_anonymization:
@@ -662,7 +603,7 @@ def analyze_contract(
 - 손해배상 책임 전가
 - 면책 불균형
 - 결과물의 완전성, 적합성, 비침해성 보증
-- \"일체의 책임\", \"보증\", \"배상\", \"침해하지 않음\" 표현
+- "일체의 책임", "보증", "배상", "침해하지 않음" 표현
 """ + "\n\n" + contract_text[:6000]
 
         refs = "\n\n".join(search(index, retrieval_query, k=8))
@@ -684,19 +625,19 @@ def analyze_contract(
 8. 제3자 지식재산권 비침해 보증 조항
 9. 손해배상, 면책, 책임 전가 조항
 10. 대학의 고의·중과실과 무관하게 책임을 부담시키는 조항
-11. \"일체의 책임\", \"보증한다\", \"침해하지 않음을 보장한다\", \"배상한다\" 등의 표현이 포함된 조항
+11. "일체의 책임", "보증한다", "침해하지 않음을 보장한다", "배상한다" 등의 표현이 포함된 조항
 12. 기업의 후속 사용행위까지 대학이 책임지도록 해석될 수 있는 조항
 
 가장 중요한 출력 원칙:
 - 반드시 [관련 규정 및 법령 발췌]에 포함된 내용에 근거하여 판단하라.
-- \"문제가 되는 근거\"에는 반드시 실제 문서명을 특정하고, 가능하면 조문/조항/항목 번호까지 명시하라.
+- "문제가 되는 근거"에는 반드시 실제 문서명을 특정하고, 가능하면 조문/조항/항목 번호까지 명시하라.
 - 예시 형식:
   - 부산대학교 지식재산권 규정 제4조
   - 국가연구개발혁신법 제16조
   - 산학협력단 계약운영지침 제12조 제3항
 - 근거 문서명이나 조문 번호를 특정할 수 없으면 그 항목은 출력하지 말라.
 - 일반론, 추정, 관행, 취지만으로는 문제 조항으로 제시하지 말라.
-- \"추가 확인 필요\"는 쓸 수 있지만, 그 경우에도 왜 근거 특정이 어려운지 설명해야 하며, \"상세 검토 결과\" 항목으로는 올리지 말고 [추가 권고]에만 적어라.
+- "추가 확인 필요"는 쓸 수 있지만, 그 경우에도 왜 근거 특정이 어려운지 설명해야 하며, "상세 검토 결과" 항목으로는 올리지 말고 [추가 권고]에만 적어라.
 - 즉, [상세 검토 결과]에는 실제 근거 문서가 특정되는 항목만 포함하라.
 
 검토 방식:
@@ -753,8 +694,6 @@ def analyze_contract(
             result_text = deanonymize_text(result_text, reverse_mapping)
 
         return result_text
+
     except Exception as e:
         return f"실행 중 오류가 발생했습니다.\n\n{type(e).__name__}: {e}\n\n{traceback.format_exc()}"
-    finally:
-        if index:
-            cleanup_index(index)
