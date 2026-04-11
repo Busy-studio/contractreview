@@ -1,17 +1,17 @@
 import hashlib
+import math
 import os
 import pickle
 import re
 import shutil
 import time
 import zipfile
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import List
 
 import fitz
 import gdown
-import numpy as np
 from docx import Document
 from google import genai
 from google.genai import errors as genai_errors
@@ -20,7 +20,6 @@ GEN_MODELS = [
     "gemini-2.5-flash",
     "gemini-3.1-flash-lite-preview",
 ]
-EMBED_MODEL = "gemini-embedding-001"
 DEFAULT_LAW_ZIP_LINK = "https://drive.google.com/file/d/1Wu5sEWPwdH7AX2n_08ViNCEZtZnhsMwH/view?usp=sharing"
 CACHE_DIR = Path(".cache")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -439,15 +438,9 @@ def find_possible_leaks(text):
     return sorted(found)
 
 
-def embed(texts, batch_size=50):
-    client = get_client()
-    all_vecs = []
-    for i in range(0, len(texts), batch_size):
-        batch = texts[i:i + batch_size]
-        res = client.models.embed_content(model=EMBED_MODEL, contents=batch)
-        batch_vecs = [e.values for e in res.embeddings]
-        all_vecs.extend(batch_vecs)
-    return np.array(all_vecs, dtype=np.float32)
+def tokenize_kr(text: str) -> List[str]:
+    text = clean_text(text).lower()
+    return re.findall(r"[가-힣a-zA-Z0-9]+", text)
 
 
 def _zip_fingerprint(zip_path: str) -> str:
@@ -455,6 +448,26 @@ def _zip_fingerprint(zip_path: str) -> str:
     stat = path.stat()
     base = f"{path.resolve()}::{stat.st_size}::{int(stat.st_mtime)}"
     return hashlib.md5(base.encode("utf-8")).hexdigest()
+
+
+def build_sparse_index(chunks: List[str], meta: List[str]):
+    doc_tokens = [tokenize_kr(c) for c in chunks]
+    doc_freq = defaultdict(int)
+
+    for tokens in doc_tokens:
+        for term in set(tokens):
+            doc_freq[term] += 1
+
+    avg_doc_len = sum(len(tokens) for tokens in doc_tokens) / max(len(doc_tokens), 1)
+
+    return {
+        "chunks": chunks,
+        "meta": meta,
+        "doc_tokens": doc_tokens,
+        "doc_freq": dict(doc_freq),
+        "num_docs": len(doc_tokens),
+        "avg_doc_len": avg_doc_len,
+    }
 
 
 def build_index(zip_path: str):
@@ -498,8 +511,7 @@ def build_index(zip_path: str):
     if not chunks:
         raise ValidationError("법령/규정 zip에서 텍스트를 추출하지 못했습니다.")
 
-    emb = embed(chunks, batch_size=50)
-    index = {"chunks": chunks, "meta": meta, "emb": emb}
+    index = build_sparse_index(chunks, meta)
 
     with open(cache_file, "wb") as f:
         pickle.dump(index, f)
@@ -507,20 +519,56 @@ def build_index(zip_path: str):
     return index
 
 
+def bm25_score(query_tokens, doc_tokens, doc_freq, num_docs, avg_doc_len, k1=1.5, b=0.75):
+    score = 0.0
+    doc_len = len(doc_tokens)
+    tf = Counter(doc_tokens)
+
+    for term in query_tokens:
+        if term not in tf:
+            continue
+
+        df = doc_freq.get(term, 0)
+        if df == 0:
+            continue
+
+        idf = math.log((num_docs - df + 0.5) / (df + 0.5) + 1)
+        freq = tf[term]
+        denom = freq + k1 * (1 - b + b * (doc_len / max(avg_doc_len, 1e-9)))
+        score += idf * ((freq * (k1 + 1)) / denom)
+
+    return score
+
+
 def search(index, query, k=8):
-    qv = embed([query], batch_size=1)[0]
-    emb = index["emb"]
-    qn = np.linalg.norm(qv) + 1e-12
-    en = np.linalg.norm(emb, axis=1) + 1e-12
-    sims = (emb @ qv) / (en * qn)
-    idx = np.argsort(-sims)[:k]
+    query_tokens = tokenize_kr(query)
+
+    scored = []
+    for i, doc_tokens in enumerate(index["doc_tokens"]):
+        score = bm25_score(
+            query_tokens=query_tokens,
+            doc_tokens=doc_tokens,
+            doc_freq=index["doc_freq"],
+            num_docs=index["num_docs"],
+            avg_doc_len=index["avg_doc_len"],
+        )
+        scored.append((i, score))
+
+    scored.sort(key=lambda x: x[1], reverse=True)
+    top_idx = [i for i, score in scored[:k] if score > 0]
+
+    if not top_idx:
+        top_idx = [i for i, _ in scored[:k]]
+
     results = []
-    for i in idx:
-        results.append(f"[근거문서: {os.path.basename(index['meta'][i])}]\n{index['chunks'][i]}")
+    for i in top_idx:
+        results.append(
+            f"[근거문서: {os.path.basename(index['meta'][i])}]\n{index['chunks'][i]}"
+        )
     return results
 
 
-def generate_with_retry(prompt, max_retries=6):
+def generate_with_retry(prompt, max_retries=7):
     client = get_client()
     last_error = None
 
@@ -531,6 +579,18 @@ def generate_with_retry(prompt, max_retries=6):
                     model=model_name,
                     contents=prompt
                 )
+
+            except genai_errors.ClientError as e:
+                last_error = e
+                msg = str(e)
+
+                if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
+                    wait_sec = min(3 * (2 ** attempt), 60)
+                    time.sleep(wait_sec)
+                    continue
+
+                raise
+
             except genai_errors.ServerError as e:
                 last_error = e
                 msg = str(e)
@@ -541,12 +601,19 @@ def generate_with_retry(prompt, max_retries=6):
                     continue
 
                 raise
+
             except Exception as e:
                 last_error = e
                 break
 
     if last_error:
-        if "503" in str(last_error) or "UNAVAILABLE" in str(last_error):
+        msg = str(last_error)
+        if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
+            raise RuntimeError(
+                "현재 Gemini API 사용량 한도 또는 순간 요청량 한도에 도달했습니다. "
+                "잠시 후 다시 실행해 주세요."
+            )
+        if "503" in msg or "UNAVAILABLE" in msg:
             raise RuntimeError(
                 "현재 Gemini 모델 응답이 일시적으로 몰려 있습니다. 잠시 후 다시 실행해 주세요."
             )
@@ -631,9 +698,9 @@ def analyze_contract(contract_path: str, use_anonymization: bool = True, restore
 - 면책 불균형
 - 결과물의 완전성, 적합성, 비침해성 보증
 - "일체의 책임", "보증", "배상", "침해하지 않음" 표현
-""" + "\n\n" + contract_text[:6000]
+""" + "\n\n" + contract_text[:4000]
 
-        refs = "\n\n".join(search(index, retrieval_query, k=10))
+        refs = "\n\n".join(search(index, retrieval_query, k=6))
 
         prompt = f"""
 너는 대학 산학협력 계약 검토를 전문으로 수행하는 법률 전문가다.
@@ -722,7 +789,7 @@ def analyze_contract(contract_path: str, use_anonymization: bool = True, restore
 - 각 항목은 Markdown 형식으로 작성하며, 제목과 본문 사이에는 반드시 한 줄 이상 줄바꿈을 적용하고, 목록은 블릿 기호를 사용하여 개조식으로 작성하라.
 
 [계약서]
-{contract_text[:14000]}
+{contract_text[:10000]}
 
 [관련 규정 및 법령 발췌]
 {refs}
@@ -791,6 +858,7 @@ def analyze_contract(contract_path: str, use_anonymization: bool = True, restore
 본 결과는 내부 검토 참고용이며 최종 법률자문을 대체하지 않는다.
 """
 
+        time.sleep(1.0)
         res = generate_with_retry(prompt)
         result_text = res.text if hasattr(res, "text") else str(res)
 
