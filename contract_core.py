@@ -657,7 +657,7 @@ import re
 
 def highlight_revisions(text: str) -> str:
     return re.sub(
-        r"\[\[(.*?)\]\]",
+        r"⟪(.*?)⟫",
         r'<span style="color:#1f77b4; font-weight:700;">\1</span>',
         text,
         flags=re.DOTALL
@@ -790,7 +790,7 @@ def analyze_contract(contract_path: str, use_anonymization: bool = True, restore
 - 결과의 완전성, 적합성, 비침해성 등을 단정하는 표현 대신, 연구 수행 범위와 책임 기준 중심으로 작성한다.
 - 수정 예시는 새로운 의무를 추가하는 것이 아니라 기존 조항의 위험을 완화하는 수준으로 작성한다.
 - 수정된 조항은 원 조항보다 대학에 불리해지지 않도록 한다.
-- 조항 변경 예시에서 원문 대비 변경된 핵심 부분은 [[변경된 문구]] 형식으로 표시하라.
+- 조항 변경 예시에서 원문 대비 변경된 핵심 부분은 <<변경된 문구>> 형식으로 표시하라.
 - 변경되지 않은 부분은 그대로 유지하고, 실제 수정된 부분만 표시하라.
 - 강조 범위는 최소한으로 유지하고, 문장 전체를 감싸지 말고 핵심 어구만 표시하라.
 
@@ -876,6 +876,10 @@ def analyze_contract(contract_path: str, use_anonymization: bool = True, restore
         time.sleep(1.0)
         res = generate_with_retry(prompt)
         result_text = res.text if hasattr(res, "text") else str(res)
+
+        if use_anonymization and restore_names:
+            result_text = deanonymize_text(result_text, reverse_mapping)
+
         result_text = highlight_revisions(result_text)
 
         invalid_ground_lines = validate_ground_lines(result_text)
@@ -883,9 +887,6 @@ def analyze_contract(contract_path: str, use_anonymization: bool = True, restore
             result_text += "\n\n[시스템 점검 메모]\n"
             result_text += "아래 항목은 근거 문서명 또는 조문 번호가 불충분할 수 있으므로 재검토 필요:\n"
             result_text += "\n".join(invalid_ground_lines[:20])
-
-        if use_anonymization and restore_names:
-            result_text = deanonymize_text(result_text, reverse_mapping)
 
         return result_text
 
