@@ -98,7 +98,7 @@ if run_clicked:
                     restore_names=restore_names,
                 )
             st.subheader("검토 결과")
-            st.markdown(result)
+            st.markdown(result, unsafe_allow_html=True)
     except (ValidationError, ConfigError) as e:
         st.error(str(e))
     except Exception as e:
