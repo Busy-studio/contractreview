@@ -669,8 +669,16 @@ def analyze_contract(contract_path: str, use_anonymization: bool = True, restore
         if not contract_path:
             return "오류: 검토할 계약서 파일을 업로드하세요."
 
-        resolved_zip_path = resolve_law_zip(zip_path=zip_path, zip_link=zip_link)
-        index = build_index(resolved_zip_path)
+        # 🔥 [핵심] 인덱스 로드 (속도 개선)
+        INDEX_PATH = "law_index.pkl"
+
+        if os.path.exists(INDEX_PATH):
+            with open(INDEX_PATH, "rb") as f:
+                index = pickle.load(f)
+        else:
+            # fallback (최초 1회만)
+            resolved_zip_path = resolve_law_zip(zip_path=zip_path, zip_link=zip_link)
+            index = build_index(resolved_zip_path)
 
         contract_text_raw = extract_text(contract_path)
         if not contract_text_raw.strip():
