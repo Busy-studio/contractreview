@@ -135,14 +135,14 @@ def build_docx_bytes(report_text: str, title: str = "계약 검토 결과") -> b
 
 
 def _register_pdf_fonts() -> tuple[str, str]:
+    # ReportLab 기본 Korean Unicode CID font.
+    # 별도 폰트 파일 없이 Linux/Streamlit 환경에서도 한글 텍스트 레이어를 유지한다.
     body_font = "HYSMyeongJo-Medium"
-    heading_font = "HYGoThic-Medium"
-    for font_name in (body_font, heading_font):
-        try:
-            pdfmetrics.getFont(font_name)
-        except KeyError:
-            pdfmetrics.registerFont(UnicodeCIDFont(font_name))
-    return body_font, heading_font
+    try:
+        pdfmetrics.getFont(body_font)
+    except KeyError:
+        pdfmetrics.registerFont(UnicodeCIDFont(body_font))
+    return body_font, body_font
 
 
 def _pdf_safe(text: str) -> str:
