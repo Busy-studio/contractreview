@@ -29,6 +29,8 @@ def _strip_inline_markup(text: str) -> str:
     text = _HTML_TAG_RE.sub("", text)
     text = _MARKDOWN_LINK_RE.sub(r"\1", text)
     text = text.replace("**", "").replace("__", "").replace(chr(96), "")
+    for icon in ("📌", "📄", "⚠️", "⚠", "⚖️", "⚖", "✏️", "✏", "🔎", "ℹ️", "ℹ"):
+        text = text.replace(icon, "")
     text = html.unescape(text)
     return re.sub(r"[ \t]+", " ", text).strip()
 
