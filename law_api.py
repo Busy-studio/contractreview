@@ -178,6 +178,36 @@ class OpenLawClient:
         self._cache[url] = data
         return data
 
+    def intelligent_search(self, query: str, category: int = 0, display: int = 4) -> Any:
+        """
+        지능형 법령검색 시스템 검색 API.
+        category: 0=법령조문, 1=법령 별표·서식, 2=행정규칙 조문, 3=행정규칙 별표·서식
+        """
+        return self._get_json(
+            LAW_SEARCH_URL,
+            {
+                "target": "aiSearch",
+                "query": _normalize_query(query),
+                "search": int(category),
+                "display": max(1, min(int(display), 20)),
+                "page": 1,
+            },
+        )
+
+    def related_law_search(self, query: str, category: int = 0) -> Any:
+        """
+        지능형 법령검색 시스템 연관법령 API.
+        category: 0=법령조문, 1=행정규칙조문
+        """
+        return self._get_json(
+            LAW_SEARCH_URL,
+            {
+                "target": "aiRltLs",
+                "query": _normalize_query(query),
+                "search": int(category),
+            },
+        )
+
     def search(self, source: str, query: str, display: int = 3) -> List[Dict[str, Any]]:
         if source not in SOURCE_CONFIG:
             raise ValueError(f"지원하지 않는 법령정보 소스입니다: {source}")
@@ -277,6 +307,32 @@ def collect_legal_evidence(
     items: List[Dict[str, Any]] = []
     seen_items = set()
     warnings: List[str] = []
+    intelligent_blocks: List[str] = []
+
+    # 자연어 쟁점은 지능형 검색으로 먼저 관련 조문 후보를 확보한다.
+    # aiSearch 자체가 조문번호/제목/내용을 반환하므로 별도 본문조회 없이 근거 후보로 사용한다.
+    for query in cleaned_queries[:2]:
+        for category, label in ((0, "지능형 법령조문 검색"), (2, "지능형 행정규칙조문 검색")):
+            try:
+                payload = client.intelligent_search(query, category=category, display=4)
+                text = _flatten_json(payload, max_chars=8000)
+                if text:
+                    intelligent_blocks.append(
+                        f"[{label}] 검색어: {query}\n출처: 국가법령정보센터 aiSearch API\n{text}"
+                    )
+            except Exception as e:
+                warnings.append(f"{label} 실패: {e}")
+
+        # 연관법령은 법령조문 기준으로 1회 보조 조회
+        try:
+            related = client.related_law_search(query, category=0)
+            related_text = _flatten_json(related, max_chars=4000)
+            if related_text:
+                intelligent_blocks.append(
+                    f"[지능형 연관법령 검색] 검색어: {query}\n출처: 국가법령정보센터 aiRltLs API\n{related_text}"
+                )
+        except Exception as e:
+            warnings.append(f"지능형 연관법령 검색 실패: {e}")
 
     for query in cleaned_queries:
         if len(items) >= max_items:
@@ -317,6 +373,8 @@ def collect_legal_evidence(
                 break
 
     evidence_blocks: List[str] = []
+    evidence_blocks.extend(intelligent_blocks[:6])
+
     for idx, item in enumerate(items, start=1):
         header = (
             f"[공식 근거 {idx} | {item['label']}] {item['name']}"
