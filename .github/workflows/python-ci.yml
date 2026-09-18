@@ -1,0 +1,53 @@
+name: Python CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  syntax-and-import:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Compile Python
+        run: python -m py_compile app.py contract_core.py law_api.py openai_models.py legal_validator.py
+      - name: Import core modules
+        run: |
+          python - <<'PY'
+          import law_api
+          import openai_models
+          import legal_validator
+          import contract_core
+          print("core imports: OK")
+          PY
+      - name: Smoke test internal law index
+        run: |
+          python - <<'PY'
+          import contract_core
+          index = contract_core.load_internal_index()
+          assert index["num_docs"] > 0
+          assert len(index["chunks"]) == len(index["meta"])
+          print(f"internal index docs: {index['num_docs']}")
+          PY
+      - name: Smoke test no-key fallbacks
+        run: |
+          python - <<'PY'
+          from law_api import collect_legal_evidence
+          from openai_models import analyze_contract_intake
+
+          law = collect_legal_evidence(["특허"])
+          assert law["enabled"] is False
+
+          intake = analyze_contract_intake("대학과 기업 간 위탁연구 계약. 연구성과와 특허 귀속을 정한다.")
+          assert intake["contract_type"]
+          assert intake["law_queries"]
+          print("fallbacks: OK")
+          PY

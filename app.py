@@ -26,20 +26,29 @@ def save_uploaded_file(uploaded_file) -> str:
 
 
 st.title("PNU 계약/협약서 검토")
-st.caption("기본 법령/규정 모음을 자동으로 사용합니다. 필요할 때만 ZIP 업로드 또는 외부 링크를 사용하면 됩니다.")
+st.caption("대학 내부규정 ZIP/RAG와 국가법령정보 Open API를 함께 사용해 계약서를 검토합니다.")
 
 with st.sidebar:
     st.subheader("실행 환경")
-    gemini_key_exists = bool(os.getenv("GEMINI_API_KEY", "").strip() or os.getenv("GOOGLE_API_KEY", "").strip())
-    st.write(f"- Gemini API Key 설정 여부: {'설정됨' if gemini_key_exists else '미설정'}")
-    st.write("- 지원 계약서 형식: PDF, DOCX, TXT, MD")
-    st.write("- 법령 ZIP 기본값: 저장소의 기본 법령/규정 우선 사용")
-    st.write("- 외부 링크는 기본 법령/규정이 없을 때만 사용")
-    st.write("- 법령 인덱스: 동일 ZIP 재사용 시 캐시 사용")
+    openai_key_exists = bool(os.getenv("OPENAI_API_KEY", "").strip())
+    openlaw_key_exists = bool(
+        os.getenv("OPEN_LAW_API_KEY", "").strip()
+        or os.getenv("LAW_API_KEY", "").strip()
+        or os.getenv("LAW_OPEN_API_KEY", "").strip()
+    )
+    terra_model = os.getenv("OPENAI_TERRA_MODEL", "gpt-5.6-terra")
+    sol_model = os.getenv("OPENAI_SOL_MODEL", "gpt-5.6-sol")
 
-st.subheader("법령/규정 소스")
+    st.write(f"- OpenAI API Key: {'설정됨' if openai_key_exists else '미설정'}")
+    st.write(f"- 국가법령정보 API: {'설정됨' if openlaw_key_exists else '미설정'}")
+    st.write(f"- 1차 분류 모델: {terra_model}")
+    st.write(f"- 최종 검토 모델: {sol_model}")
+    st.write("- 지원 계약서 형식: PDF, DOCX, TXT, MD")
+    st.write("- 내부규정 ZIP: 내용 해시 기반 자동 재인덱싱")
+
+st.subheader("대학 내부규정/축적 문서 소스")
 source_mode = st.radio(
-    "법령/규정 사용 방식",
+    "내부규정 사용 방식",
     ["기본값 사용", "직접 ZIP 업로드", "외부 링크 사용"],
     horizontal=True,
 )
@@ -52,7 +61,7 @@ if source_mode == "직접 ZIP 업로드":
 elif source_mode == "외부 링크 사용":
     law_zip_link = st.text_input("법령/규정 ZIP 링크 (Google Drive 등)")
 else:
-    st.info("기본 법령/규정 모음을 자동으로 사용합니다.")
+    st.info("저장소의 lawcollect.zip을 내부규정 RAG 소스로 사용합니다. ZIP을 교체하면 자동으로 새 인덱스를 생성합니다.")
 
 st.subheader("계약서 설정")
 col1, col2 = st.columns([1, 1])
@@ -61,6 +70,7 @@ with col1:
 with col2:
     use_anonymization = st.checkbox("자동 익명화 적용", value=True)
     restore_names = st.checkbox("검토 결과에서 원래 이름 복원", value=True)
+    st.caption("국가법령정보 API 키가 설정되어 있으면 현행법령·행정규칙·판례·법령해석례를 자동 조회합니다.")
 
 btn_col1, btn_col2 = st.columns(2)
 preview_clicked = btn_col1.button("익명화 미리보기", use_container_width=True)
@@ -86,6 +96,8 @@ if run_clicked:
     try:
         if contract_file is None:
             st.error("계약서를 먼저 업로드하세요.")
+        elif not openai_key_exists:
+            st.error("OPENAI_API_KEY가 설정되지 않았습니다. Streamlit Secrets에 OpenAI API 키를 등록하세요.")
         else:
             zip_path = save_uploaded_file(law_zip) if law_zip is not None else None
             contract_path = save_uploaded_file(contract_file)
