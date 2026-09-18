@@ -58,23 +58,42 @@ jobs:
           import io
           import fitz
           from docx import Document
-          from export_utils import build_docx_bytes, build_pdf_bytes
+          from export_utils import build_docx_bytes, build_pdf_bytes, parse_review_report, render_review_html
 
           sample = (
               "## 검토 요약\n\n"
-              "- 계약 유형: 위탁연구·용역\n"
-              "- 주요 독소/위험조항: 총 1건\n\n"
-              "## 독소조항 검토\n\n"
-              "### 1. 지식재산권 귀속 | 위험도: 높음\n\n"
-              "#### 독소조항 원문\n"
+              "- **계약 유형:** 위탁연구·용역\n"
+              "- **주요 검토조항:** 총 2건\n"
+              "- **우선 수정 필요:** 지식재산권 귀속, 대금 지급\n"
+              "- **총평:** 주요 조항을 수정할 필요가 있습니다.\n\n"
+              "## 주요 검토조항\n\n"
+              "### 1. 지식재산권 귀속 | 분류: 🔴 법적 위험\n\n"
+              "#### 📄 검토 대상 원문\n"
               "- 제10조: 모든 지식재산권은 기업에 귀속한다.\n\n"
-              "#### 문제되는 이유\n"
+              "#### ⚠️ 문제되는 이유\n"
               "- 대학의 기존기술까지 이전되는 것으로 해석될 위험\n\n"
-              "#### 근거\n"
+              "#### ⚖️ 근거\n"
               "- 특허법 제44조: 공동출원 관련 기준\n\n"
-              "#### 조항 변경 예시\n"
-              "- 제10조: 기존기술은 각 당사자에게 귀속한다.\n"
+              "#### ✏️ 조항 변경 예시\n"
+              "- 제10조: 기존기술은 각 당사자에게 귀속한다.\n\n"
+              "### 2. 대금 지급기한 | 분류: 🟡 협상 권고\n\n"
+              "#### 📄 검토 대상 원문\n"
+              "- 잔금은 완료 후 지급한다.\n\n"
+              "#### ⚠️ 문제되는 이유\n"
+              "- 구체적인 지급기한이 없습니다.\n\n"
+              "#### ✏️ 조항 변경 예시\n"
+              "- 잔금은 청구일부터 30일 이내 지급한다.\n"
           )
+
+          parsed = parse_review_report(sample)
+          assert len(parsed["items"]) == 2
+          assert parsed["items"][0]["classification"] == "legal"
+          assert parsed["items"][1]["classification"] == "negotiation"
+          assert not parsed["items"][1]["sections"]["basis"]
+
+          web_html = render_review_html(sample)
+          assert "법적 위험" in web_html
+          assert "협상 권고" in web_html
 
           docx_bytes = build_docx_bytes(sample, "계약 검토 결과")
           pdf_bytes = build_pdf_bytes(sample, "계약 검토 결과")
@@ -84,13 +103,18 @@ jobs:
 
           docx = Document(io.BytesIO(docx_bytes))
           docx_text = "\n".join(p.text for p in docx.paragraphs)
-          assert "독소조항" in docx_text
+          docx_text += "\n" + "\n".join(
+              p.text for table in docx.tables for row in table.rows for cell in row.cells for p in cell.paragraphs
+          )
           assert "지식재산권" in docx_text
+          assert "법적 위험" in docx_text
+          assert "협상 권고" in docx_text
+          assert len(docx.tables) >= 5
 
           pdf = fitz.open(stream=pdf_bytes, filetype="pdf")
           pdf_text = "\n".join(page.get_text() for page in pdf)
-          assert "독소조항" in pdf_text
           assert "지식재산권" in pdf_text
+          assert "협상 권고" in pdf_text
 
           print("report exports: OK")
           PY

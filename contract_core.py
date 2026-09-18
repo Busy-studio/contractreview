@@ -20,6 +20,7 @@ from openai_models import (
     TERRA_MODEL,
     analyze_contract_intake,
     generate_final_review,
+    plan_precedent_search,
 )
 
 DEFAULT_LAW_ZIP_LINK = "https://drive.google.com/file/d/1Wu5sEWPwdH7AX2n_08ViNCEZtZnhsMwH/view?usp=sharing"
@@ -672,65 +673,119 @@ def analyze_contract(
         )
         local_refs = "\n\n".join(search(index, retrieval_query, k=6))
 
-        # 3) 국가법령정보 Open API: 현행법령/행정규칙/판례/법령해석례 공식 근거 조회
-        official = collect_legal_evidence(
+        # 3) 1차 근거 조회: 현행법령/행정규칙/법령해석 + 대학 내부규정
+        primary = collect_legal_evidence(
             law_queries or issue_tags,
-            max_items=8,
-            max_queries=4,
+            max_items=6,
+            max_queries=3,
+            sources=("law", "admrul", "expc"),
+            include_intelligent=True,
         )
-        official_refs = str(official.get("evidence") or "").strip()
-        openlaw_warning = str(official.get("warning") or "").strip()
+        primary_refs = str(primary.get("evidence") or "").strip()
+        openlaw_warning = str(primary.get("warning") or "").strip()
 
-        evidence_sections = []
-        if official_refs:
+        primary_for_planning = (
+            "[공식 법령/행정규칙/법령해석]\n"
+            + (primary_refs or "확인된 1차 공식 근거 없음")
+            + "\n\n[대학 내부규정/축적 문서]\n"
+            + (local_refs or "확인된 내부규정 근거 없음")
+        )
+
+        # 4) 직접 근거가 약한 쟁점에 대해서만 판례를 보조 검색
+        precedent_queries = plan_precedent_search(
+            contract_type=contract_type,
+            issue_tags=issue_tags,
+            primary_evidence=primary_for_planning,
+        )
+        precedent = {
+            "enabled": False,
+            "evidence": "",
+            "items": [],
+            "warning": "",
+        }
+        if precedent_queries:
+            precedent = collect_legal_evidence(
+                precedent_queries,
+                max_items=3,
+                max_queries=3,
+                sources=("prec",),
+                include_intelligent=False,
+            )
+
+        precedent_refs = str(precedent.get("evidence") or "").strip()
+        precedent_warning = str(precedent.get("warning") or "").strip()
+        if precedent_warning:
+            openlaw_warning = "\n".join(
+                part for part in (openlaw_warning, precedent_warning) if part
+            )
+
+        evidence_sections = [
+            "[A. 국가법령정보센터 - 법령/행정규칙/법령해석]\n"
+            + (primary_refs or "확인된 직접 공식 근거 없음"),
+            "[B. 대학 내부규정/축적 문서 RAG]\n"
+            + (local_refs or "확인된 내부규정 근거 없음"),
+        ]
+        if precedent_refs:
             evidence_sections.append(
-                "[A. 국가법령정보센터 공식 근거]\n"
-                + official_refs
+                "[C. 국가법령정보센터 - 관련 판례]\n" + precedent_refs
             )
         else:
             evidence_sections.append(
-                "[A. 국가법령정보센터 공식 근거]\n"
-                + "공식 API 근거가 제공되지 않았음. 외부 법령을 기억에 의존해 인용하지 말 것."
+                "[C. 국가법령정보센터 - 관련 판례]\n"
+                + "선택적 판례검색에서 직접 관련 판례 근거를 확보하지 못함"
             )
 
-        evidence_sections.append(
-            "[B. 대학 내부규정/축적 문서 RAG]\n"
-            + (local_refs or "검색된 내부/축적 문서 근거 없음")
-        )
         all_evidence = "\n\n".join(evidence_sections)
 
         source_status = (
             "국가법령정보 Open API 사용"
-            if official.get("enabled")
+            if primary.get("enabled")
             else "국가법령정보 Open API 미사용(키 미설정 또는 조회 불가)"
         )
 
-        # 4) GPT-5.6 Sol: 최종 계약 검토
+        # 5) GPT-5.6 Sol: 근거 수준에 따라 검토조항을 분류
         prompt = f"""
 너는 대학 산학협력단·기술사업화 조직의 계약 검토를 지원하는 법률 검토 AI다.
-사용자가 가장 빠르게 확인해야 할 것은 "독소/위험조항의 원문, 문제되는 이유, 근거, 변경 예시"이다.
-따라서 결과를 짧고 실무적으로 작성하고, 법령 설명 자체를 길게 늘어놓지 않는다.
+사용자가 가장 빠르게 확인해야 할 것은 "문제가 되는 계약조항, 이유, 확인된 근거, 조항 변경 예시"이다.
+결과를 짧고 실무적으로 작성하고, 법률 설명 자체를 장황하게 늘어놓지 않는다.
 
 [1차 분류 결과]
 - 계약 유형: {contract_type}
 - 핵심 쟁점: {", ".join(issue_tags) if issue_tags else "미분류"}
-- 데이터 소스 상태: {source_status}
+- 공식 데이터 상태: {source_status}
+- 선택적 판례검색어: {", ".join(precedent_queries) if precedent_queries else "없음"}
+
+판정 분류는 아래 4개만 사용한다.
+
+1) 🔴 법적 위험
+- [A]의 현행법령/행정규칙 등 직접 적용 가능한 근거가 실제 확인되고,
+  해당 조항이 그 기준에 위반되거나 무효·책임 발생 가능성이 구체적으로 문제되는 경우에만 사용.
+
+2) 🟠 판례상·분쟁 위험
+- 직접적인 위법 단정은 어렵지만 [C]의 관련 판례가 동일·유사 쟁점의 해석이나 책임 판단에 실질적으로 뒷받침되는 경우 사용.
+
+3) 🔵 내부규정 검토
+- [B]의 대학 내부규정·지침과 실제 충돌하거나 별도 절차 이행이 필요한 경우 사용.
+
+4) 🟡 협상 권고
+- 법령·판례·내부규정으로 직접 뒷받침되는 위험은 확인되지 않았지만,
+  지급조건, 책임배분, 범위 불명확, 일방적 재량 등 계약실무상 불리하거나 협상할 필요가 있는 경우 사용.
+- 이 분류에는 "법적 위험", "위법", "무효"라는 표현을 사용하지 않는다.
+- 별도의 "근거" 섹션을 만들지 않는다.
 
 판단 원칙:
-1. 법령명, 조문번호, 판례, 법령해석례를 기억으로 만들어내지 않는다.
-2. 공식 법률 근거는 반드시 [A. 국가법령정보센터 공식 근거]에서 실제 확인되는 것만 인용한다.
-3. 대학 내부규정·지침은 [B. 대학 내부규정/축적 문서 RAG]에서 실제 확인되는 것만 인용한다.
-4. 대학에 불리한 조항과 위법한 조항을 구분한다. 불리하다는 이유만으로 위법이라고 단정하지 않는다.
-5. 직접 적용 여부가 불확실한 자료는 "참고 근거"라고 표시한다.
-6. 계약서에 없는 조항번호나 문구를 만들어내지 않는다.
-7. 서로 연결된 조항은 하나의 위험항목으로 묶어 중복 설명하지 않는다.
-8. 실질적으로 수정할 필요가 큰 조항을 우선하고, 사소하거나 반복적인 사항은 제외한다.
-9. 독소/위험조항은 최대 8개까지만 제시한다.
-10. 각 항목의 "문제되는 이유"는 최대 3개 블릿, "근거"는 최대 3개 블릿으로 제한한다.
-11. 직접 확인된 법령·규정 근거가 없으면 억지로 근거를 만들지 말고
-   "- 직접 확인된 법령·규정 근거 없음 - 계약실무상 위험"이라고 명시한다.
-12. 조항 변경 예시는 실제 계약서에 붙여 넣을 수 있는 완성 문장으로 작성한다.
-13. 변경 핵심 부분만 <chg>변경 문구</chg>로 표시한다.
+1. 법령명, 조문번호, 판례 사건번호, 법령해석례를 기억으로 만들어내지 않는다.
+2. 근거는 반드시 [검토 근거]에서 실제 확인되는 것만 사용한다.
+3. 판례는 사건의 구체적 사실관계가 다를 수 있으므로 "참고" 또는 "유사 쟁점"임을 짧게 표시한다.
+4. 대학에 불리하다는 이유만으로 법적 위험으로 분류하지 않는다.
+5. 서로 연결된 조항은 하나의 검토항목으로 묶어 중복 설명하지 않는다.
+6. 실질적으로 수정할 필요가 큰 조항을 우선하고 최대 8개까지만 제시한다.
+7. "문제되는 이유"는 최대 3개 블릿으로 제한한다.
+8. "근거"는 있는 경우에만 최대 3개 블릿으로 제한한다.
+9. 근거가 없으면 "근거 없음" 같은 문장을 억지로 넣지 말고 해당 항목을 🟡 협상 권고로 분류한다.
+10. 조항 변경 예시는 실제 계약서에 붙여 넣을 수 있는 완성 문장으로 작성한다.
+11. 계약서 원문에 없는 조항번호나 문구를 생성하지 않는다.
+12. 변경 핵심 부분만 <chg>변경 문구</chg>로 표시한다.
 
 중점 검토:
 - 계약금액·지급시기·상계
@@ -747,42 +802,50 @@ def analyze_contract(
 {contract_text[:14000]}
 
 [검토 근거]
-{all_evidence[:35000]}
+{all_evidence[:42000]}
 
-반드시 아래 출력 형식만 사용한다.
-"적용 근거 구분", "법령정보 조회 상태", "적용 여부 추가 확인 필요", "자동검증 메모" 같은 별도 장문 섹션은 만들지 않는다.
+반드시 아래 형식을 사용한다.
 
 ## 📌 검토 요약
 
 - **계약 유형:**
-- **주요 독소/위험조항:** 총 ○건
-- **우선 수정 필요:** 가장 중요한 2~3개 쟁점만
+- **주요 검토조항:** 총 ○건
+- **우선 수정 필요:** 가장 중요한 2~3개
 - **총평:** 2문장 이내
 
-## 📌 독소조항 검토
+## 📌 주요 검토조항
 
-### 1. 조항 제목 | 위험도: 높음/보통
+### 1. 조항 제목 | 분류: 🔴 법적 위험
 
-#### 📄 독소조항 원문
-- 제○조 제○항: 실제 계약서 원문
-- 연결된 조항이 있으면 필요한 범위에서만 추가
+#### 📄 검토 대상 원문
+- 실제 계약서 문구
 
 #### ⚠️ 문제되는 이유
-- 핵심 이유 1
-- 핵심 이유 2
-- 필요한 경우에만 핵심 이유 3
+- 핵심 이유
+- 핵심 이유
 
 #### ⚖️ 근거
-- 법령/내부규정/판례명 + 정확한 조문·사건번호 + 이 조항과 직접 관련된 짧은 요지
-- 최대 3개
-- 직접 근거가 없으면 "직접 확인된 법령·규정 근거 없음 - 계약실무상 위험"
+- 확인된 법령/규정/판례 + 정확한 조문·사건번호 + 짧은 관련성 설명
 
 #### ✏️ 조항 변경 예시
-- 제○조 제○항: 실제 대체 가능한 완성 문안
+- 실제 대체 가능한 완성 문안
 
 ---
 
-위 구조를 위험조항마다 반복한다.
+분류가 🟠 판례상·분쟁 위험 또는 🔵 내부규정 검토인 경우에도 근거가 실제 확인되면 위와 동일하게 "근거"를 작성한다.
+
+분류가 🟡 협상 권고인 경우에는 아래처럼 "근거" 제목 자체를 생략한다.
+
+### 2. 조항 제목 | 분류: 🟡 협상 권고
+
+#### 📄 검토 대상 원문
+- 실제 계약서 문구
+
+#### ⚠️ 문제되는 이유
+- 계약실무상 불리하거나 불명확한 이유
+
+#### ✏️ 조항 변경 예시
+- 실제 대체 가능한 완성 문안
 
 ## ⚠️ 주의
 본 결과는 내부 검토 참고용이며 최종 법률자문을 대체하지 않는다.
@@ -795,7 +858,7 @@ def analyze_contract(
 
         result_text = highlight_revisions(result_text)
 
-        # 5) 근거 검증은 서버 진단용으로만 수행하고 사용자 본문은 단순하게 유지한다.
+        # 6) 근거 검증은 서버 진단용으로만 수행하고 사용자 본문은 단순하게 유지한다.
         unverified = find_unverified_citations(result_text, all_evidence)
         if unverified:
             print("[근거 자동검증] 재확인 필요:", " | ".join(unverified[:20]))

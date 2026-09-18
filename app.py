@@ -10,7 +10,7 @@ from contract_core import (
     analyze_contract,
     preview_anonymized,
 )
-from export_utils import build_docx_bytes, build_pdf_bytes
+from export_utils import build_docx_bytes, build_pdf_bytes, render_review_html
 
 st.set_page_config(
     page_title="PNU 계약/협약서 검토",
@@ -135,8 +135,7 @@ if run_clicked:
 
 
 if st.session_state.get("review_result"):
-    st.subheader("검토 결과")
-    st.markdown(st.session_state["review_result"], unsafe_allow_html=True)
+    st.markdown(render_review_html(st.session_state["review_result"]), unsafe_allow_html=True)
 
     st.divider()
     st.subheader("검토결과 보고서 다운로드")

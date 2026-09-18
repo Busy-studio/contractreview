@@ -167,6 +167,65 @@ def analyze_contract_intake(contract_text: str) -> Dict[str, Any]:
         return fallback
 
 
+def plan_precedent_search(
+    contract_type: str,
+    issue_tags: List[str],
+    primary_evidence: str,
+) -> List[str]:
+    """
+    법령/행정규칙/내부규정만으로 판단 근거가 약한 쟁점에 대해서만
+    판례 검색어를 생성한다. 최대 3개.
+    """
+    prompt = f"""
+너는 대학-기업 계약 검토 시스템의 판례 검색 플래너다.
+아래 핵심 쟁점과 1차 근거를 비교하여, 법령·행정규칙·내부규정만으로 판단 근거가 충분하지 않고
+판례가 실제로 도움이 될 쟁점만 골라 국가법령정보센터 판례검색용 검색어를 생성하라.
+
+반드시 JSON 객체 하나만 출력:
+{{
+  "queries": ["검색어1", "검색어2"]
+}}
+
+원칙:
+- 최대 3개
+- 판례가 없어도 계약실무상 협상으로 처리할 수 있는 단순 지급조건·문구명확화 문제는 남발하지 않는다.
+- 손해배상 예정/책임제한, 해지, 하자, 공동특허, 비밀유지, 사용자책임처럼 법적 해석이 중요한 쟁점을 우선한다.
+- 판례 사건번호를 추측하지 않는다.
+- 검색어는 8~30자 정도의 한국어 핵심어 조합으로 작성한다.
+- 1차 근거가 충분하면 빈 배열을 반환한다.
+
+계약유형: {contract_type}
+핵심쟁점: {", ".join(issue_tags)}
+
+[1차 근거]
+{primary_evidence[:18000]}
+"""
+    try:
+        raw = generate_text(
+            prompt,
+            model=TERRA_MODEL,
+            reasoning_effort="medium",
+            max_output_tokens=1200,
+        )
+        data = _extract_json_object(raw)
+        queries = data.get("queries", [])
+        if not isinstance(queries, list):
+            return []
+        cleaned = []
+        seen = set()
+        for query in queries:
+            q = re.sub(r"\s+", " ", str(query or "")).strip()
+            if not q or q in seen:
+                continue
+            seen.add(q)
+            cleaned.append(q[:80])
+            if len(cleaned) >= 3:
+                break
+        return cleaned
+    except Exception:
+        return []
+
+
 def generate_final_review(prompt: str) -> str:
     return generate_text(
         prompt,
