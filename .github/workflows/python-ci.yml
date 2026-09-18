@@ -113,8 +113,8 @@ jobs:
 
           pdf = fitz.open(stream=pdf_bytes, filetype="pdf")
           pdf_text = "\n".join(page.get_text() for page in pdf)
-          assert "독소조항" in pdf_text
           assert "지식재산권" in pdf_text
+          assert "협상 권고" in pdf_text
 
           print("report exports: OK")
           PY
