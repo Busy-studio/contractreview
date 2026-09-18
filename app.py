@@ -96,6 +96,8 @@ if run_clicked:
     try:
         if contract_file is None:
             st.error("계약서를 먼저 업로드하세요.")
+        elif not openai_key_exists:
+            st.error("OPENAI_API_KEY가 설정되지 않았습니다. Streamlit Secrets에 OpenAI API 키를 등록하세요.")
         else:
             zip_path = save_uploaded_file(law_zip) if law_zip is not None else None
             contract_path = save_uploaded_file(contract_file)
