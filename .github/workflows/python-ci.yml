@@ -28,3 +28,26 @@ jobs:
           import contract_core
           print("core imports: OK")
           PY
+      - name: Smoke test internal law index
+        run: |
+          python - <<'PY'
+          import contract_core
+          index = contract_core.load_internal_index()
+          assert index["num_docs"] > 0
+          assert len(index["chunks"]) == len(index["meta"])
+          print(f"internal index docs: {index['num_docs']}")
+          PY
+      - name: Smoke test no-key fallbacks
+        run: |
+          python - <<'PY'
+          from law_api import collect_legal_evidence
+          from openai_models import analyze_contract_intake
+
+          law = collect_legal_evidence(["특허"])
+          assert law["enabled"] is False
+
+          intake = analyze_contract_intake("대학과 기업 간 위탁연구 계약. 연구성과와 특허 귀속을 정한다.")
+          assert intake["contract_type"]
+          assert intake["law_queries"]
+          print("fallbacks: OK")
+          PY
