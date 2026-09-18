@@ -528,6 +528,10 @@ def load_internal_index(zip_path: str | None = None, zip_link: str | None = None
         resolved_zip_path = resolve_law_zip(zip_path=zip_path, zip_link=zip_link)
         return build_index(resolved_zip_path)
     except Exception:
+        # 사용자가 직접 지정한 ZIP/링크가 실패한 경우에는 조용히 다른 인덱스로 대체하지 않는다.
+        if (zip_path and str(zip_path).strip()) or (zip_link and str(zip_link).strip()):
+            raise
+
         legacy_index = Path("law_index.pkl")
         if legacy_index.exists():
             with open(legacy_index, "rb") as f:
