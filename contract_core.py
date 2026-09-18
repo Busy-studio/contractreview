@@ -13,13 +13,15 @@ from typing import List
 import fitz
 import gdown
 from docx import Document
-from google import genai
-from google.genai import errors as genai_errors
+from law_api import collect_legal_evidence
+from legal_validator import find_unverified_citations
+from openai_models import (
+    SOL_MODEL,
+    TERRA_MODEL,
+    analyze_contract_intake,
+    generate_final_review,
+)
 
-GEN_MODELS = [
-    "gemini-2.5-flash",
-    "gemini-3.1-flash-lite-preview",
-]
 DEFAULT_LAW_ZIP_LINK = "https://drive.google.com/file/d/1Wu5sEWPwdH7AX2n_08ViNCEZtZnhsMwH/view?usp=sharing"
 CACHE_DIR = Path(".cache")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -31,23 +33,6 @@ class ConfigError(RuntimeError):
 
 class ValidationError(ValueError):
     pass
-
-
-def get_api_key() -> str:
-    api_key = (
-        os.getenv("GEMINI_API_KEY", "").strip()
-        or os.getenv("GOOGLE_API_KEY", "").strip()
-    )
-    if not api_key:
-        raise ConfigError(
-            "GEMINI_API_KEY 또는 GOOGLE_API_KEY 환경변수가 비어 있습니다. "
-            "Streamlit Cloud의 Secrets 또는 로컬 환경변수에 API 키를 설정하세요."
-        )
-    return api_key
-
-
-def get_client() -> genai.Client:
-    return genai.Client(api_key=get_api_key())
 
 
 def download_drive_file(url: str, output_path: str) -> str:
@@ -89,11 +74,20 @@ def resolve_law_zip(zip_path: str | None = None, zip_link: str | None = None) ->
     if zip_path and str(zip_path).strip():
         return validate_zip_path(zip_path)
 
+    # 사용자가 외부 링크를 명시한 경우 저장소 기본 ZIP보다 우선한다.
+    if zip_link and str(zip_link).strip():
+        link = str(zip_link).strip()
+        hashed = hashlib.md5(link.encode("utf-8")).hexdigest()[:16]
+        cached_zip_path = CACHE_DIR / f"law_zip_{hashed}.zip"
+        if cached_zip_path.exists() and zipfile.is_zipfile(cached_zip_path):
+            return str(cached_zip_path)
+        return download_drive_file(link, str(cached_zip_path))
+
     local_zip_path = Path("lawcollect.zip")
     if local_zip_path.exists() and zipfile.is_zipfile(local_zip_path):
         return str(local_zip_path)
 
-    link = (zip_link or DEFAULT_LAW_ZIP_LINK).strip()
+    link = DEFAULT_LAW_ZIP_LINK.strip()
     hashed = hashlib.md5(link.encode("utf-8")).hexdigest()[:16]
     cached_zip_path = CACHE_DIR / f"law_zip_{hashed}.zip"
 
@@ -444,10 +438,13 @@ def tokenize_kr(text: str) -> List[str]:
 
 
 def _zip_fingerprint(zip_path: str) -> str:
-    path = Path(zip_path)
-    stat = path.stat()
-    base = f"{path.resolve()}::{stat.st_size}::{int(stat.st_mtime)}"
-    return hashlib.md5(base.encode("utf-8")).hexdigest()
+    # 파일 경로/mtime이 아니라 ZIP 실제 내용으로 식별한다.
+    # 규정 ZIP이 바뀌면 자동으로 새 인덱스를 만들고, 내용이 같으면 기존 캐시를 재사용한다.
+    digest = hashlib.sha256()
+    with open(zip_path, "rb") as f:
+        for block in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def build_sparse_index(chunks: List[str], meta: List[str]):
@@ -519,6 +516,25 @@ def build_index(zip_path: str):
     return index
 
 
+def load_internal_index(zip_path: str | None = None, zip_link: str | None = None):
+    """
+    대학 내부규정/축적 문서 인덱스를 로드한다.
+
+    - ZIP이 있으면 ZIP 내용 해시 기반 캐시를 사용한다.
+    - ZIP이 교체되면 자동으로 새 인덱스를 생성한다.
+    - ZIP을 찾을 수 없는 구버전 배포 환경에서만 기존 law_index.pkl을 fallback으로 사용한다.
+    """
+    try:
+        resolved_zip_path = resolve_law_zip(zip_path=zip_path, zip_link=zip_link)
+        return build_index(resolved_zip_path)
+    except Exception:
+        legacy_index = Path("law_index.pkl")
+        if legacy_index.exists():
+            with open(legacy_index, "rb") as f:
+                return pickle.load(f)
+        raise
+
+
 def bm25_score(query_tokens, doc_tokens, doc_freq, num_docs, avg_doc_len, k1=1.5, b=0.75):
     score = 0.0
     doc_len = len(doc_tokens)
@@ -568,60 +584,6 @@ def search(index, query, k=8):
     return results
 
 
-def generate_with_retry(prompt, max_retries=7):
-    client = get_client()
-    last_error = None
-
-    for model_name in GEN_MODELS:
-        for attempt in range(max_retries):
-            try:
-                return client.models.generate_content(
-                    model=model_name,
-                    contents=prompt
-                )
-
-            except genai_errors.ClientError as e:
-                last_error = e
-                msg = str(e)
-
-                if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
-                    wait_sec = min(3 * (2 ** attempt), 60)
-                    time.sleep(wait_sec)
-                    continue
-
-                raise
-
-            except genai_errors.ServerError as e:
-                last_error = e
-                msg = str(e)
-
-                if "503" in msg or "UNAVAILABLE" in msg or "high demand" in msg.lower():
-                    wait_sec = min(2 ** attempt, 30)
-                    time.sleep(wait_sec)
-                    continue
-
-                raise
-
-            except Exception as e:
-                last_error = e
-                break
-
-    if last_error:
-        msg = str(last_error)
-        if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
-            raise RuntimeError(
-                "현재 Gemini API 사용량 한도 또는 순간 요청량 한도에 도달했습니다. "
-                "잠시 후 다시 실행해 주세요."
-            )
-        if "503" in msg or "UNAVAILABLE" in msg:
-            raise RuntimeError(
-                "현재 Gemini 모델 응답이 일시적으로 몰려 있습니다. 잠시 후 다시 실행해 주세요."
-            )
-        raise last_error
-
-    raise RuntimeError("모델 응답 생성에 실패했습니다.")
-
-
 def preview_anonymized(contract_path):
     try:
         if not contract_path:
@@ -663,22 +625,19 @@ def highlight_revisions(text: str) -> str:
         flags=re.DOTALL
     )
 
-def analyze_contract(contract_path: str, use_anonymization: bool = True, restore_names: bool = False,
-                     zip_path: str | None = None, zip_link: str | None = None) -> str:
+def analyze_contract(
+    contract_path: str,
+    use_anonymization: bool = True,
+    restore_names: bool = False,
+    zip_path: str | None = None,
+    zip_link: str | None = None,
+) -> str:
     try:
         if not contract_path:
             return "오류: 검토할 계약서 파일을 업로드하세요."
 
-        # 🔥 [핵심] 인덱스 로드 (속도 개선)
-        INDEX_PATH = "law_index.pkl"
-
-        if os.path.exists(INDEX_PATH):
-            with open(INDEX_PATH, "rb") as f:
-                index = pickle.load(f)
-        else:
-            # fallback (최초 1회만)
-            resolved_zip_path = resolve_law_zip(zip_path=zip_path, zip_link=zip_link)
-            index = build_index(resolved_zip_path)
+        # 1) 대학 내부규정/축적 문서 RAG
+        index = load_internal_index(zip_path=zip_path, zip_link=zip_link)
 
         contract_text_raw = extract_text(contract_path)
         if not contract_text_raw.strip():
@@ -691,212 +650,186 @@ def analyze_contract(contract_path: str, use_anonymization: bool = True, restore
         else:
             contract_text = contract_text_raw
 
-        retrieval_query = """
-대학과 기업 간 계약 검토.
+        # 2) GPT-5.6 Terra: 계약 유형/쟁점/법령 검색어 구조화
+        intake = analyze_contract_intake(contract_text[:12000])
+        contract_type = str(intake.get("contract_type", "기타/혼합형 계약"))
+        issue_tags = [str(x) for x in intake.get("issue_tags", [])]
+        law_queries = [str(x) for x in intake.get("law_queries", [])]
 
-먼저 확인할 사항:
-- 민간재원 기반 공동연구 계약인지 여부
-- 일반 용역, 시험, 분석, 자문, 검증, 평가 계약인지 여부
-- 기술이전, 실시권, 옵션, 우선협상권 관련 계약인지 여부
+        local_query = str(intake.get("local_rag_query") or "").strip()
+        if not local_query:
+            local_query = " ".join(issue_tags)
+
+        retrieval_query = (
+            f"계약유형: {contract_type}\n"
+            f"핵심쟁점: {', '.join(issue_tags)}\n"
+            f"내부규정 검색어: {local_query}\n\n"
+            + contract_text[:5000]
+        )
+        local_refs = "\n\n".join(search(index, retrieval_query, k=8))
+
+        # 3) 국가법령정보 Open API: 현행법령/행정규칙/판례/법령해석례 공식 근거 조회
+        official = collect_legal_evidence(
+            law_queries or issue_tags,
+            max_items=8,
+            max_queries=4,
+        )
+        official_refs = str(official.get("evidence") or "").strip()
+        openlaw_warning = str(official.get("warning") or "").strip()
+
+        evidence_sections = []
+        if official_refs:
+            evidence_sections.append(
+                "[A. 국가법령정보센터 공식 근거]\n"
+                + official_refs
+            )
+        else:
+            evidence_sections.append(
+                "[A. 국가법령정보센터 공식 근거]\n"
+                + "공식 API 근거가 제공되지 않았음. 외부 법령을 기억에 의존해 인용하지 말 것."
+            )
+
+        evidence_sections.append(
+            "[B. 대학 내부규정/축적 문서 RAG]\n"
+            + (local_refs or "검색된 내부/축적 문서 근거 없음")
+        )
+        all_evidence = "\n\n".join(evidence_sections)
+
+        source_status = (
+            "국가법령정보 Open API 사용"
+            if official.get("enabled")
+            else "국가법령정보 Open API 미사용(키 미설정 또는 조회 불가)"
+        )
+
+        # 4) GPT-5.6 Sol: 최종 계약 검토
+        prompt = f"""
+너는 대학 산학협력단·기술사업화 조직의 계약 검토를 지원하는 법률 검토 AI다.
+최종 법률자문이 아니라 내부 실무 검토 초안을 작성한다.
+
+[1차 분류 결과]
+- 계약 유형: {contract_type}
+- 핵심 쟁점: {", ".join(issue_tags) if issue_tags else "미분류"}
+- 법령 검색어: {", ".join(law_queries) if law_queries else "미분류"}
+- 데이터 소스 상태: {source_status}
+
+가장 중요한 원칙:
+1. 법령명, 조문번호, 판례, 법령해석례를 기억으로 만들어내지 않는다.
+2. 공식 법률 근거는 반드시 [A. 국가법령정보센터 공식 근거]에 실제 포함된 내용에서만 인용한다.
+3. 대학 내부규정·지침은 [B. 대학 내부규정/축적 문서 RAG]에서 실제 확인되는 경우에만 인용한다.
+4. 표준계약서, 예규, 다른 공공기관 기준은 해당 계약에 직접 적용되는 법령이라고 단정하지 않는다.
+5. "직접 적용 법령", "기관 내부 적용기준", "참고 가능한 기준/판례", "적용 여부 추가 확인 필요"를 구분한다.
+6. 계약의 재원, 당사자의 법적 지위, 국가연구개발사업 해당 여부 등이 불명확하면 적용 여부를 단정하지 말고 추가 확인사항으로 표시한다.
+7. 근거가 없는 일반적 계약실무 의견은 상세 법률근거 항목에 넣지 말고 "실무상 추가 권고"로 구분한다.
+8. 계약서 원문을 인용할 때는 실제 원문에 있는 조항번호와 문구만 사용한다. 없는 조항번호를 생성하지 않는다.
+9. 대학에 불리하다는 이유만으로 위법이라고 단정하지 않는다. 불리함, 법적 위험, 내부규정 충돌 가능성을 구분한다.
 
 중점 검토:
-- 지식재산권 귀속
-- 연구성과물 소유권
-- 공동연구 결과물 귀속
-- 기업 단독귀속
-- 무상양도
-- 독점 실시권
-- 우선협상권
-- 논문/성과 공개 제한
-- 대학에 불리한 조항
-- 대학의 과도한 보증 조항
-- 제3자 지식재산권 비침해 보증
-- 손해배상 책임 전가
-- 면책 불균형
-- 결과물의 완전성, 적합성, 비침해성 보증
-- "일체의 책임", "보증", "배상", "침해하지 않음" 표현
-""" + "\n\n" + contract_text[:4000]
+- 계약 목적과 계약 유형의 적정성
+- 연구비/용역대금 지급과 정산
+- 지식재산권·연구성과 귀속
+- 기존 보유기술(Background IP)과 신규성과 구분
+- 직무발명 및 특허출원·비용부담
+- 기술이전·실시권·우선협상권
+- 논문·학회발표 및 연구성과 공개
+- 비밀유지 범위와 기간
+- 성과보증·비침해보증·적합성보증
+- 손해배상·면책·책임한도
+- 계약해지 및 기수행 비용 정산
+- 투자계약인 경우 우선주, 상환/전환, 청산우선권, 희석방지, 동반/강제매도, 경영동의권, 창업자 의무, IP 관련 진술보장
 
-        refs = "\n\n".join(search(index, retrieval_query, k=6))
-
-        prompt = f"""
-너는 대학 산학협력 계약 검토를 전문으로 수행하는 법률 전문가다.
-실무 계약 검토 기준에 따라 보수적이고 근거 중심으로 판단하라.
-
-다음 계약서를 대학 입장에서 검토하라.
-단순히 불리 조항을 나열하는 것이 아니라, 먼저 계약의 성격과 적용 가능한 법령 및 규정의 범위를 판단한 후 그 범위 내에서 검토하라.
-대학에 불리할 수 있는 조항은 반드시 제공된 관련 규정 및 법령 발췌에서 근거를 확인할 수 있는 경우에만 제시하라.
-
-가장 먼저 해야 할 판단:
-- 계약서의 명칭, 목적, 당사자, 비용 부담 구조, 연구개발비 재원, 과제명, 협약 체계 등을 종합하여 계약의 성격을 판단하라.
-- 아래 유형 중 해당되는 유형을 하나 이상 선택하여 정리하라.
-  1. 민간재원 기반 공동연구 계약
-  2. 일반 용역, 시험, 분석, 자문, 검증, 평가 계약
-  3. 기술이전, 실시권, 옵션, 우선협상권 관련 계약
-  4. 혼합형 계약
-
-적용 법령 및 규정 판단 원칙:
-- 계약과 관련된 법령 및 규정을 폭넓게 식별하되, 다음의 법적 위계에 따라 검토 기준을 설정하라:
-  1. 민법 및 관련 상위 법령
-  2. 지식재산권 관련 법령 등 개별 법률
-  3. 공공계약 관련 기준 및 예규
-  4. 대학 내부 규정 및 지침
-- 대학 내부 규정은 상위 법령에 반하지 않는 범위에서 적용되는 기준으로 활용하라.
-- 대학은 공공기관의 성격을 가지므로, 민간 계약이라 하더라도 공공계약 기준, 내부 규정, 민법, 지식재산권 관련 법령을 종합적으로 검토 기준으로 활용하라.
-- 특정 법령의 형식적 적용 여부와 관계없이, 대학에 불리한 조항 판단을 위해 유사한 법령 및 규정의 취지와 기준을 참고할 수 있다.
-
-중점 검토 항목:
-1. 지식재산권 귀속
-2. 연구성과물 소유권
-3. 공동연구 결과물의 공동소유 여부
-4. 기업 단독귀속 또는 무상양도
-5. 독점적 실시권, 우선협상권
-6. 논문 발표 및 성과공개 제한
-7. 대학의 과도한 책임 부담 조항
-8. 제3자 지식재산권 관련 책임 조항
-9. 손해배상, 면책, 책임 전가 조항
-10. 대학의 고의 또는 과실과 무관하게 책임을 부담시키는 조항
-11. 포괄적 책임 또는 불명확한 책임 범위를 규정하는 조항
-12. 기업의 후속 사용행위까지 대학의 책임으로 확장될 수 있는 조항
-
-가장 중요한 출력 원칙:
-- 모든 판단은 반드시 [관련 규정 및 법령 발췌]에 포함된 내용을 근거로 한다.
-- "문제가 되는 근거"에는 문서명과 조문, 조항 또는 항목 번호를 명확히 제시한다.
-- 예시:
-  - 민법 제750조
-  - 특허법 제33조
-  - 부산대학교 지식재산권 규정 제4조
-  - 산학협력단 계약운영지침 제12조 제3항
-- 근거 문서와 조문을 특정할 수 있는 경우에만 검토 결과를 작성한다.
-- 일반적인 해석이나 관행만으로는 검토 항목으로 포함하지 않는다.
-- 적용 가능성이 불명확한 경우에는 해당 내용을 [추가 권고]로 구분하여 제시한다.
-
-검토 방식:
-- 먼저 계약 유형을 판단한다.
-- 다음으로 계약과 관련성이 있는 법령 및 규정을 폭넓게 식별한다.
-- "우선 적용 검토 법령/규정(복수)"에는 실제 검토에서 근거로 사용할 가능성이 높은 규정을 상위법부터 하위 규정 순으로 정리한다.
-
-예시:
-- 민법
-- 특허법
-- 저작권법
-- 공공계약 관련 기준 또는 예규
-- 부산대학교 지식재산권관리 및 기술사업화 추진에 관한 규정
-- 산학협력단 계약운영지침
-- 산학협력단 세부운영지침
-
-- 이후 검토에서는 위 규정 중 실제 조문이 특정 가능한 경우에만 근거로 활용한다.
-- 문제가 되는 조항은 계약서의 원문을 그대로 인용하고, 반드시 해당 조항 번호(제○조 제○항)를 함께 표시한다.
-- 조항 번호를 확인할 수 있는 경우에만 해당 항목을 작성한다.
-
-조항 수정 예시 작성 기준:
-- 실제 대학-기업 산학협력 계약서에 반영 가능한 문장으로 작성한다.
-- 기존 조항의 구조와 표현을 유지하면서 위험 요소를 완화하는 방향으로 수정한다.
-- 당사자의 권리와 의무가 명확하게 드러나도록 작성한다.
-- 책임 범위는 고의 또는 중대한 과실 등으로 명확하게 한정한다.
-- 불확정적이거나 포괄적인 책임이 발생하지 않도록 표현을 구성한다.
-- 결과의 완전성, 적합성, 비침해성 등을 단정하는 표현 대신, 연구 수행 범위와 책임 기준 중심으로 작성한다.
-- 수정 예시는 새로운 의무를 추가하는 것이 아니라 기존 조항의 위험을 완화하는 수준으로 작성한다.
-- 수정된 조항은 원 조항보다 대학에 불리해지지 않도록 한다.
-- 조항 변경 예시에서 원문 대비 변경된 핵심 부분은 <chg>변경된 문구</chg> 형식으로 표시하라.
-- 변경되지 않은 부분은 그대로 유지하고, 실제 수정된 부분만 표시하라.
-- 강조 범위는 최소한으로 유지하고, 문장 전체를 감싸지 말고 핵심 어구만 표시하라.
-
-작성 형식:
-- 마크다운 문법을 사용하지 않고 일반 텍스트로 작성한다.
-- 실무 검토 문체로 작성한다.
-- 답변은 한국어로 작성한다.
-- 각 항목은 Markdown 형식으로 작성하며, 제목과 본문 사이에는 반드시 한 줄 이상 줄바꿈을 적용하고, 목록은 블릿 기호를 사용하여 개조식으로 작성하라.
-- 하나의 검토 항목에 여러 조항이 포함되는 경우, 각 조항은 반드시 별도의 블릿("- ")으로 나누어 한 줄씩 작성하라.
-- "독소조항 원문", "관련 근거", "조항 변경 예시"는 문단형으로 이어 쓰지 말고 항목별 목록 형태로 작성하라.
-- 각 블릿 항목 사이에는 줄바꿈을 유지하고, 하나의 줄에 둘 이상의 조항을 이어서 쓰지 말라.
+조항 수정안 작성 원칙:
+- 실제 계약서에 바로 반영 가능한 문장으로 작성
+- 원 조항의 구조는 가능한 유지
+- 위험 요소를 완화하는 최소 수정
+- 새 의무를 임의로 만들지 않음
+- 변경 핵심 부분만 <chg>변경 문구</chg>로 표시
 
 [계약서]
-{contract_text[:10000]}
+{contract_text[:14000]}
 
-[관련 규정 및 법령 발췌]
-{refs}
+[검토 근거]
+{all_evidence[:50000]}
 
 출력 형식:
 
 ## 📌 검토 요약
 
-- **계약 유형 판단:**  
-- **우선 적용 검토 법령/규정(복수):**  
-- **전체 위험도:**  
-- **핵심 총평:**  
+- **계약 유형 판단:**
+- **핵심 쟁점:**
+- **공식 법령정보 조회 상태:** {source_status}
+- **전체 위험도:** 낮음 / 보통 / 높음 중 하나
+- **핵심 총평:**
 
+## ⚖️ 적용 근거 구분
+
+### 직접 적용 검토 법령
+- 근거에서 실제 확인되는 법령과 조문만 작성
+- 직접 적용 여부가 확실하지 않으면 이 항목에 넣지 않음
+
+### 기관 내부 적용기준
+- 대학 내부규정/지침에서 실제 확인되는 조항만 작성
+
+### 참고 가능한 기준·판례·법령해석
+- 직접 적용 법령과 구분하여 작성
+
+### 적용 여부 추가 확인 필요
+- 계약 재원, 사업유형, 당사자 지위 등 추가 사실 확인이 필요한 사항
 
 ## 📌 상세 검토 결과
 
+쟁점별로 아래 구조 반복:
+
 ### 1. 조항 제목 또는 유형
 
-#### 📄 독소조항 원문
-- 제○조 제○항: (계약서 원문)
-- 제○조 제○항: (계약서 원문)
-- 제○조 제○항: (계약서 원문)
+#### 📄 검토 대상 원문
+- 제○조 제○항: 실제 계약서 원문
 
-#### ⚠️ 독소조항인 이유
-- 대학 입장에서 왜 불리한지 개조식으로 설명
-- 권리 제한, 책임 확대, 불균형 요소 중심으로 정리
+#### ⚠️ 검토 의견
+- 대학 입장에서의 위험 또는 불균형
+- 위법 여부와 계약상 불리함을 구분
 
 #### ⚖️ 관련 근거
-- 문서명 + 조문/조항/항목 번호: 관련 내용
-- 문서명 + 조문/조항/항목 번호: 관련 내용
+- 문서명 + 정확한 조문/사건번호/안건번호 + 근거 요지
+- [검토 근거]에 없는 출처는 작성 금지
 
 #### ✏️ 조항 변경 예시
-- 제○조 제○항: (수정 문안)
-- 제○조 제○항: (수정 문안)
-
+- 제○조 제○항: 수정문안
 
 ---
 
-### 2. 조항 제목 또는 유형
-
-#### 📄 독소조항 원문
-- 제○조 제○항: (계약서 원문)
-- 제○조 제○항: (계약서 원문)
-
-#### ⚠️ 독소조항인 이유
-- 대학 입장에서 왜 불리한지 개조식으로 설명
-- 필요 시 2~3개 항목으로 정리
-
-#### ⚖️ 관련 근거
-- 문서명 + 조문/조항/항목 번호: 관련 내용
-
-#### ✏️ 조항 변경 예시
-- 제○조 제○항: (수정 문안)
-
-
----
-
-## 📌 추가 권고
-
-- 근거 문서가 부족하거나 적용 여부가 불명확하여 상세 검토 결과에는 포함하지 않았지만 추가 검토가 필요한 사항
-- 필요한 추가 확인 문서 또는 규정명
-
+## 📌 실무상 추가 권고
+- 법률근거가 충분하지 않지만 협상·계약관리상 확인할 사항
+- 추가로 필요한 자료 또는 사실관계
 
 ## ⚠️ 주의
-
 본 결과는 내부 검토 참고용이며 최종 법률자문을 대체하지 않는다.
 """
 
-        time.sleep(1.0)
-        res = generate_with_retry(prompt)
-        result_text = res.text if hasattr(res, "text") else str(res)
+        result_text = generate_final_review(prompt)
 
         if use_anonymization and restore_names:
             result_text = deanonymize_text(result_text, reverse_mapping)
 
         result_text = highlight_revisions(result_text)
 
-        invalid_ground_lines = validate_ground_lines(result_text)
-        if invalid_ground_lines:
-            result_text += "\n\n[시스템 점검 메모]\n"
-            result_text += "아래 항목은 근거 문서명 또는 조문 번호가 불충분할 수 있으므로 재검토 필요:\n"
-            result_text += "\n".join(invalid_ground_lines[:20])
+        # 5) 최종 출력에 등장한 법령/규정 조문이 실제 전달된 근거에 있는지 1차 기계 검증
+        unverified = find_unverified_citations(result_text, all_evidence)
+        if unverified:
+            result_text += "\n\n## 🔎 근거 자동검증 메모\n"
+            result_text += (
+                "- 아래 인용은 전달된 공식/내부 근거 텍스트에서 문서명과 조문번호의 동시 일치를 "
+                "기계적으로 확인하지 못했습니다. 최종 사용 전 원문 확인이 필요합니다.\n"
+            )
+            for citation in unverified[:20]:
+                result_text += f"- {citation}\n"
+
+        if openlaw_warning:
+            result_text += "\n\n## ℹ️ 법령 API 조회 메모\n"
+            for line in openlaw_warning.splitlines()[:12]:
+                result_text += f"- {line}\n"
 
         return result_text
 
     except Exception as e:
         return f"실행 중 오류가 발생했습니다.\n\n{type(e).__name__}: {e}"
+
