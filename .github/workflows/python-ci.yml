@@ -18,7 +18,7 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
       - name: Compile Python
-        run: python -m py_compile app.py contract_core.py law_api.py openai_models.py legal_validator.py
+        run: python -m py_compile app.py contract_core.py law_api.py openai_models.py legal_validator.py export_utils.py
       - name: Import core modules
         run: |
           python - <<'PY'
@@ -26,6 +26,7 @@ jobs:
           import openai_models
           import legal_validator
           import contract_core
+          import export_utils
           print("core imports: OK")
           PY
       - name: Smoke test internal law index
@@ -50,4 +51,46 @@ jobs:
           assert intake["contract_type"]
           assert intake["law_queries"]
           print("fallbacks: OK")
+          PY
+      - name: Smoke test DOCX/PDF exports
+        run: |
+          python - <<'PY'
+          import io
+          import fitz
+          from docx import Document
+          from export_utils import build_docx_bytes, build_pdf_bytes
+
+          sample = (
+              "## 검토 요약\n\n"
+              "- 계약 유형: 위탁연구·용역\n"
+              "- 주요 독소/위험조항: 총 1건\n\n"
+              "## 독소조항 검토\n\n"
+              "### 1. 지식재산권 귀속 | 위험도: 높음\n\n"
+              "#### 독소조항 원문\n"
+              "- 제10조: 모든 지식재산권은 기업에 귀속한다.\n\n"
+              "#### 문제되는 이유\n"
+              "- 대학의 기존기술까지 이전되는 것으로 해석될 위험\n\n"
+              "#### 근거\n"
+              "- 특허법 제44조: 공동출원 관련 기준\n\n"
+              "#### 조항 변경 예시\n"
+              "- 제10조: 기존기술은 각 당사자에게 귀속한다.\n"
+          )
+
+          docx_bytes = build_docx_bytes(sample, "계약 검토 결과")
+          pdf_bytes = build_pdf_bytes(sample, "계약 검토 결과")
+
+          assert docx_bytes[:2] == b"PK"
+          assert pdf_bytes[:4] == b"%PDF"
+
+          docx = Document(io.BytesIO(docx_bytes))
+          docx_text = "\n".join(p.text for p in docx.paragraphs)
+          assert "독소조항" in docx_text
+          assert "지식재산권" in docx_text
+
+          pdf = fitz.open(stream=pdf_bytes, filetype="pdf")
+          pdf_text = "\n".join(page.get_text() for page in pdf)
+          assert "독소조항" in pdf_text
+          assert "지식재산권" in pdf_text
+
+          print("report exports: OK")
           PY

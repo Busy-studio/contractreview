@@ -10,12 +10,22 @@ from contract_core import (
     analyze_contract,
     preview_anonymized,
 )
+from export_utils import build_docx_bytes, build_pdf_bytes
 
 st.set_page_config(
     page_title="PNU 계약/협약서 검토",
     page_icon="📄",
     layout="wide",
 )
+
+for key, default in {
+    "review_result": None,
+    "review_docx": None,
+    "review_pdf": None,
+    "review_filename": "계약검토결과",
+}.items():
+    if key not in st.session_state:
+        st.session_state[key] = default
 
 
 def save_uploaded_file(uploaded_file) -> str:
@@ -101,6 +111,7 @@ if run_clicked:
         else:
             zip_path = save_uploaded_file(law_zip) if law_zip is not None else None
             contract_path = save_uploaded_file(contract_file)
+
             with st.spinner("계약서를 검토 중입니다..."):
                 result = analyze_contract(
                     zip_path=zip_path,
@@ -109,9 +120,42 @@ if run_clicked:
                     use_anonymization=use_anonymization,
                     restore_names=restore_names,
                 )
-            st.subheader("검토 결과")
-            st.markdown(result, unsafe_allow_html=True)
+
+            report_stem = Path(contract_file.name).stem.strip() or "계약서"
+            report_title = f"{report_stem} 계약 검토 결과"
+
+            st.session_state["review_result"] = result
+            st.session_state["review_docx"] = build_docx_bytes(result, report_title)
+            st.session_state["review_pdf"] = build_pdf_bytes(result, report_title)
+            st.session_state["review_filename"] = f"{report_stem}_계약검토결과"
     except (ValidationError, ConfigError) as e:
         st.error(str(e))
     except Exception as e:
         st.exception(e)
+
+
+if st.session_state.get("review_result"):
+    st.subheader("검토 결과")
+    st.markdown(st.session_state["review_result"], unsafe_allow_html=True)
+
+    st.divider()
+    st.subheader("검토결과 보고서 다운로드")
+    st.caption("DOCX와 PDF 모두 실제 텍스트 문서로 생성되어 내용 선택·복사가 가능합니다.")
+
+    download_col1, download_col2 = st.columns(2)
+    with download_col1:
+        st.download_button(
+            "Word 문서(.docx) 다운로드",
+            data=st.session_state["review_docx"],
+            file_name=f"{st.session_state['review_filename']}.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            use_container_width=True,
+        )
+    with download_col2:
+        st.download_button(
+            "PDF 문서(.pdf) 다운로드",
+            data=st.session_state["review_pdf"],
+            file_name=f"{st.session_state['review_filename']}.pdf",
+            mime="application/pdf",
+            use_container_width=True,
+        )
